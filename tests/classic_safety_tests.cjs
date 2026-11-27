@@ -178,7 +178,7 @@ async function workerSet() {
 async function bootPage(o) {
   o = typeof o === "function" ? { load: o } : (o || {});
   const D = makeDom(pageIds(read("index.html")), o.canvas || ((c) => (c.id === "canvas" || c.id === "inetc" ? recorder() : null)));
-  const P = makeWindow(D, "http://classic.test/web/index.html?threads=0&view=" + (o.view || "flat") + "&guide=0&intro=0", { media: ["min-width: 960px"] });
+  const P = makeWindow(D, "http://classic.test/web/index.html?threads=0&view=" + (o.view || "flat") + "&guide=0&intro=0" + (o.bench ? "&bench" : ""), { media: ["min-width: 960px"] });
   const box = { M: null };
   if (o.scene) P.ctx.EvoScene = o.scene;
   if (o.gl) P.ctx.EvoGL = o.gl;   /* (a stand-in for web/gl_renderer.js: the flat view's WebGL drawing) */
@@ -1425,6 +1425,160 @@ async function reviewP3Round6() {
   }
 }
 
+/* ================================================ 11. PR #104 final-review follow-up ================================================ */
+async function followupBurst() {
+  section("11a. Turbo refusal/accept burst, both already running and flushHeld during entry");
+  for (const held of [false, true]) {
+    const G = await startedPage({ dash: true }), { el, box } = G;
+    const cp = JSON.parse(box.M.UTF8ToString(box.M._evo_checkpoint()));
+    cp.config.predatorMinPopulation = 2001;
+    await G.load("floor2001.json", JSON.stringify(cp));
+    el("turbobtn").click();
+    if (!held) await until(() => G.state() === "turbo", "Turbo running");
+    G.setField("adv_predatorMinPopulation", -1);
+    G.setField("adv_foodEnergy", 6); // no reply between commands
+    const answered = await quick(() => /Energy per food is now 6/.test(G.said()));
+    const w = workers[workers.length - 1], actual = configOf(w.w.ctx.Module);
+    ok(answered && G.state() === "turbo" && actual.predatorMinPopulation === 2000 &&
+       box.host.runConfig().predatorMinPopulation === 2000 && el("adv_predatorMinPopulation").value === "2000",
+       (held ? "flushHeld" : "running burst") + ": before hand-back, worker, record and field all say 2000", [actual.predatorMinPopulation, box.host.runConfig().predatorMinPopulation, el("adv_predatorMinPopulation").value]);
+    el("turboexit").click(); await until(() => G.state() === "live", "hand-back");
+  }
+}
+async function followupSpeedWords() {
+  section("11b. Restart describes init's defaults, conversions and coupled speed swap");
+  const G = await startedPage(), { el, box } = G;
+  G.setField("adv_minSpeed", 200);
+  el("advreset").click(); G.settle();
+  G.setField("adv_minSpeed", 200);
+  el("restart").click(); G.settle();
+  const m = el("startaskmsg").textContent;
+  ok(G.asked() && /live tweak \(Fastest speed 200\) carries over/.test(m) && /setup sets Slowest speed 150 instead of your live tweak \(Slowest speed 200\)/.test(m),
+     "200, Reset, 200, Restart: the question says Slowest 150 / Fastest 200", m);
+  el("startconfirm").click(); G.settle();
+  const c = configOf(box.M);
+  ok(c.minSpeed === 150 && c.maxSpeed === 200, "confirmed init runs exactly 150 / 200", [c.minSpeed, c.maxSpeed]);
+}
+async function followupBoot3d() {
+  section("11c. setView's caught trap ends boot before start, ready or bench init");
+  for (const bench of [false, true]) {
+    const st = { threads: 0, trapped: false, after: 0 };
+    const scene = { load: () => Promise.resolve(), create: () => new Proxy({}, { get: (t, k) => {
+      if (k === "then" || typeof k === "symbol") return undefined;
+      if (k === "following") return () => false;
+      if (k === "quality") return () => 3;
+      return () => {};
+    } }) };
+    const prep = (m) => {
+      asThreaded(m);
+      for (const k of Object.keys(m)) if (/^_evo_/.test(k) && typeof m[k] === "function") {
+        const f = m[k]; m[k] = function () { if (st.trapped) st.after++; return f.apply(this, arguments); };
+      }
+      m._evo_threads = () => { if (++st.threads === 2) { st.trapped = true; throw trapErr("3d boot"); } return 1; };
+    };
+    const G = await bootPage({ view: "3d", scene, threaded: true, prep, bench });
+    let ready = 0; G.P.ctx.addEventListener("evo:ready", () => ready++);
+    await quick(() => st.trapped, 20000);
+    await new Promise((r) => setTimeout(r, 20));
+    for (let i = 0; i < 3; i++) G.P.frame();
+    ok(st.trapped && st.after === 0 && !G.P.ctx.EvoApp.ready && ready === 0 && G.el("splash").classList.contains("failed"),
+       (bench ? "bench" : "normal") + " 3d boot: failure screen, no module calls or ready after trap", [st, G.P.ctx.EvoApp.ready, ready]);
+  }
+}
+async function followupMissingAssets() {
+  section("11d. missing EVO_ASSETS names the missing asset manifest");
+  const G = await bootPage({ noAssets: true });
+  ok(G.el("splash").classList.contains("failed") && /missing EVO_ASSETS/.test(G.el("splashstate").textContent) && !/missing loader.js/.test(G.el("splashstate").textContent),
+     "failure screen names EVO_ASSETS", G.el("splashstate").textContent);
+}
+const resourceLimits = { population: 20000, minPopulation: 20000, targetFood: 100000,
+  foodSpawnBase: 100000, foodSpawnAmp: 100000, predatorCount: 10000, predatorMinPopulation: 10000,
+  genomeMinLength: 1024, genomeMaxLength: 1024, genomeInitMin: 1024, genomeInitMax: 1024,
+  foodPatches: 10000, currentEddies: 10000, reproWindow: 1000000 };
+const cstr = (M, str, fn) => { const n = M.lengthBytesUTF8(str) + 1, p = M._malloc(n); M.stringToUTF8(str, p, n); try { return fn(p); } finally { M._free(p); } };
+async function followupLimits() {
+  section("11e. allocation and loop ceilings: engine, live page, setup, file and Turbo");
+  const M = await mkClassic();
+  M._evo_init(42, 1920, 1080, 1, 0);
+  const before = M.UTF8ToString(M._evo_checkpoint());
+  // Just past the chosen ceilings is safe to probe even on main. Never try an
+  // OOM value against the old module; page/worker spies below catch those first.
+  for (const [k, limit] of Object.entries(resourceLimits)) {
+    const cfg = { [k]: limit + 1 };
+    if (k === "currentEddies") cfg.currentStrength = 1;
+    const r = k === "population" ? M._evo_init(42, 1920, 1080, limit + 1, 0)
+      : cstr(M, JSON.stringify(cfg), (p) => M._evo_init(42, 1920, 1080, 1, p));
+    const err = M.UTF8ToString(M._evo_last_error());
+    ok(r === 0 && err.includes(String(limit)) && M.UTF8ToString(M._evo_checkpoint()) === before,
+       k + " init above " + limit + ": refused with limit, old world/RNG unchanged", [r, err]);
+    if (r) M._evo_init(42, 1920, 1080, 1, 0); // isolate main's expected failures
+  }
+  for (const k of ["minPopulation", "targetFood", "foodSpawnBase", "foodSpawnAmp"]) {
+    const limit = resourceLimits[k];
+    const r = cstr(M, k, (p) => M._evo_set_param(p, limit + 1));
+    ok(r === 0 && M.UTF8ToString(M._evo_last_error()).includes(String(limit)), k + " setter above limit refused");
+    const accepted = cstr(M, k, (p) => M._evo_set_param(p, limit));
+    ok(accepted === 1 && configOf(M)[k] === limit, k + " setter at limit still accepted unchanged");
+    M._evo_init(42, 1920, 1080, 1, 0);
+  }
+  for (const [w, h, p] of [[4097, 100, 80], [100, 4097, 80], [1920, 1080, -80]]) {
+    const cp = JSON.parse(before); cp.world.width = w; cp.world.height = h; cp.config.perceptionRadius = p;
+    const r = cstr(M, JSON.stringify(cp), (ptr) => M._evo_load_checkpoint(ptr));
+    ok(r === 0 && /safe limit/.test(M.UTF8ToString(M._evo_last_error())), "file geometry refuses dimensions/grid beyond ceiling", [w, h, p, r]);
+  }
+  const cp = JSON.parse(before); cp.config.targetFood = 100001;
+  ok(cstr(M, JSON.stringify(cp), (p) => M._evo_load_checkpoint(p)) === 0 && /100000/.test(M.UTF8ToString(M._evo_last_error())), "hand-edited file refuses unsafe food before throwaway init");
+  // Exercise all allocation settings' boundaries without stepping large worlds.
+  for (const [k, limit] of Object.entries(resourceLimits)) {
+    const cfg = { [k]: limit };
+    if (k === "currentEddies") cfg.currentStrength = 1;
+    const r = k === "population" ? M._evo_init(42, 100, 100, limit, 0)
+      : cstr(M, JSON.stringify(cfg), (p) => M._evo_init(42, 100, 100, 1, p));
+    ok(r === 1, k + " init at safe ceiling succeeds", r);
+  }
+  for (const turbo of [false, true]) {
+    const G = await startedPage(), { el, box } = G;
+    if (turbo) { el("turbobtn").click(); await until(() => G.state() === "turbo", "Turbo running"); }
+    let calls = 0;
+    const active = turbo ? workers[workers.length - 1].w.ctx.Module : box.M;
+    const set = active._evo_set_param;
+    active._evo_set_param = () => { calls++; return 0; };
+    for (const [k, value] of [["targetFood", 1e8], ["minPopulation", 999999999], ["foodSpawnBase", 100001], ["foodSpawnAmp", 100001]]) {
+      G.setField("adv_" + k, value);
+      await new Promise((resolve) => setImmediate(() => setImmediate(resolve))); // drain queued setters while the spy still fences main
+      ok(calls === 0 && G.said().includes("safe limit of " + resourceLimits[k]) && +el("adv_" + k).value === configOf(active)[k],
+         (turbo ? "Turbo" : "live") + " " + k + ": refused before engine, limit named, field restored", G.said());
+    }
+    active._evo_set_param = set;
+    if (turbo) { el("turboexit").click(); await until(() => G.state() === "live", "hand-back"); }
+    // Setup-only values refuse without calling init (and keep the old run).
+    const init = box.M._evo_init; let inits = 0;
+    box.M._evo_init = () => { inits++; return 0; };
+    for (const [id, limit] of [["population", 20000], ["predators", 10000], ["foodPatches", 10000], ["adv_genomeInitMin", 1024], ["adv_genomeInitMax", 1024], ["adv_genomeMinLength", 1024], ["adv_genomeMaxLength", 1024], ["adv_currentEddies", 10000]]) {
+      const was = el(id).value; G.setField(id, limit + 1); el("restart").click(); G.settle();
+      if (G.asked()) { el("startconfirm").click(); G.settle(); }
+      ok(inits === 0 && G.said().includes("safe limit of " + limit), id + ": setup refuses before engine and names limit", G.said());
+      G.setField(id, was);
+    }
+    box.M._evo_init = init;
+  }
+  const got = [], W = makeWorker((m) => got.push(m));
+  W.send({ cmd: "start", checkpoint: before }); await until(() => W.ctx.running, "direct worker start");
+  W.ctx.Module._evo_set_param = () => { throw new Error("unsafe value reached engine"); };
+  for (const k of ["targetFood", "minPopulation", "foodSpawnBase", "foodSpawnAmp"]) {
+    W.send({ cmd: "set", key: k, value: resourceLimits[k] + 1 });
+    const m = got.filter((m) => m.type === "set").pop();
+    ok(m && !m.ok && m.error.includes("safe limit of " + resourceLimits[k]), "direct worker " + k + ": limit checked before engine", m);
+  }
+  W.ctx.running = false;
+}
+async function followupCi() {
+  section("11f. CI web-ui includes the real safety suite");
+  const ci = fs.readFileSync(path.join(__dirname, "..", ".github", "workflows", "ci.yml"), "utf8");
+  const job = ci.match(/^  web-ui:[\s\S]*?(?=^  [a-z][\w-]*:)/m);
+  ok(job && /run: node tests\/classic_safety_tests\.cjs/.test(job[0]), "web-ui runs classic_safety_tests.cjs");
+}
+
 (async () => {
   /* each section on its own: one section's throw never hides the next (sections 3 and 4b go on section 2's page) */
   const run = async (name, f) => { try { return await f(); } catch (e) { ok(false, name + " threw: " + (e && e.stack || e)); return null; } };
@@ -1438,7 +1592,7 @@ async function reviewP3Round6() {
                    reviewTweakFlag, reviewAuthoritativeRevert, reviewNestedFence, reviewWorkerFatal, reviewNoSilentClamps,
                    reviewTurboStartThrows, reviewFirstDraw, reviewSeedKept,
                    reviewStaleAfterRefusal, reviewResetWords, reviewBootFence, reviewFallbackTrap, reviewRefusedOnTheWay,
-                   reviewP3Round6]) await run(t.name, t);
+                   reviewP3Round6, followupBurst, followupSpeedWords, followupBoot3d, followupMissingAssets, followupLimits, followupCi]) await run(t.name, t);
   ok(escaped.length === 0, "nothing escaped to node in the whole run (no unhandled rejection, no uncaught exception)", escaped.slice(0, 3));
   for (const w of workers) w.terminate();
   console.log((fails ? "FAILED " + fails + " of " : "all ") + checks + " checks" + (fails ? "" : " passed"));
