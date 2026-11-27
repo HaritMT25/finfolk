@@ -21,6 +21,11 @@
 //      in order (an older refusal leaves a newer value's field alone); a frame error that persists is said once, retried
 //      once a second, and the tank falls back to the flat view; the record of what runs is the engine's (a loaded floor of
 //      0.5 runs as 0, the speeds the engine put in order, a float said as typed)
+//   6. the second review of PR #104 (6a and 6c fail on fe5f9e6): two values that print the same at seven digits but run as
+//      two (1.5, 1.5000001) are a live tweak and a change of history; the page's record of every live value is the engine's,
+//      value for value (the rule it keeps it by, with no read of the world but for the speeds and the predator floor);
+//      values the engine cannot keep (past float32, ten-digit whole numbers) refused first, here and in Turbo; a world whose
+//      checkpoint stopped being JSON (a fish's energy overflowed) contained here, in the worker, in its recovery, at the hand-back
 // The page runs on tests/ui_inspector_tests.cjs's small DOM and window (its ids from web/index.html).
 "use strict";
 const fs = require("fs");
@@ -75,7 +80,7 @@ class FakeWorker {
     this.w = makeWorker((m) => setImmediate(() => { if (!this.dead && this.onmessage) this.onmessage({ data: m }); }));
     workers.push(this);
   }
-  postMessage(m) { const c = structuredClone(m); setImmediate(() => { if (!this.dead) this.w.send(c); }); }
+  postMessage(m) { if (m && m.cmd === "set") this.sets = (this.sets || 0) + 1; const c = structuredClone(m); setImmediate(() => { if (!this.dead) this.w.send(c); }); }
   terminate() { this.dead = true; if (this.w.ctx.running !== undefined) vm.runInContext("running = false;", this.w.ctx); }
 }
 
@@ -98,11 +103,16 @@ async function workerSet() {
   W.send({ cmd: "set", key: "foodPatches", value: 3 });
   W.send({ cmd: "set", key: "foodEnergy", value: -1 });
   W.send({ cmd: "set", key: "maxPopulation", value: 400, quiet: true });
+  W.send({ cmd: "set", key: "minSpeed", value: 200, readback: true });
+  W.send({ cmd: "set", key: "metabolicRate", value: 1e39 });
   const sets = got.slice(n0).filter((m) => m.type === "set");
-  ok(sets.length === 4 && sets[0].ok === true && sets[0].value === 900 && sets[0].quiet === false && !sets[0].notRunning,
+  ok(sets.length === 6 && sets[0].ok === true && sets[0].value === 900 && sets[0].quiet === false && !sets[0].notRunning,
      "Turbo running: targetFood 900 applied between chunks, answered ok", sets[0]);
-  ok(sets[0].config && sets[0].config.targetFood === 900 && sets[0].config.minPopulation === 50 && sets[1].config === null,
-     "  the answer carries the world's config as its engine now holds it (the page's record); a refusal none", sets[0].config && sets[0].config.targetFood);
+  ok(sets[0].config === null && sets[4].ok === true && sets[4].config && sets[4].config.minSpeed === 150 && sets[4].config.maxSpeed === 200 && !sets[4].configError,
+     "  asked to read back (minSpeed 200, a key the engine's clamps move): its answer carries the world's config as the engine holds it " +
+     "(the speeds swapped: 150 / 200); a plain value's answer reads nothing (config null)", [sets[0].config, sets[4].config && [sets[4].config.minSpeed, sets[4].config.maxSpeed]]);
+  ok(sets[5].ok === false && /metabolicRate is too large for the engine/.test(sets[5].error),
+     "  metabolicRate 1e39 (finite, but past float32: it would run as infinity and break every checkpoint): refused before it is applied", sets[5]);
   ok(sets[1].ok === false && /not a live parameter/.test(sets[1].error) && !sets[1].notRunning,
      "  foodPatches (not live): the engine refuses it, with its reason", sets[1]);
   ok(sets[2].ok === false && /finite and >= 0/.test(sets[2].error), "  foodEnergy -1: the engine refuses it", sets[2]);
@@ -110,7 +120,7 @@ async function workerSet() {
   W.send({ cmd: "stop" });
   await until(() => got.some((m) => m.type === "checkpoint"), "the hand-back's checkpoint");
   const cp = JSON.parse(last("checkpoint").json);
-  ok(cp.config.targetFood === 900 && cp.config.maxPopulation === 400 && cp.config.foodEnergy === 5 && cp.world.frame > 0,
+  ok(cp.config.targetFood === 900 && cp.config.maxPopulation === 400 && cp.config.foodEnergy === 5 && cp.config.metabolicRate === 1.5 && cp.world.frame > 0,
      "the hand-back's checkpoint carries the applied values (targetFood 900, maxPopulation 400; foodEnergy still 5) at frame " + cp.world.frame,
      [cp.config.targetFood, cp.config.maxPopulation, cp.config.foodEnergy]);
   W.send({ cmd: "set", key: "targetFood", value: 700 });
@@ -127,6 +137,9 @@ async function bootPage(o) {
   const P = makeWindow(D, "http://classic.test/web/index.html?threads=0&view=" + (o.view || "flat") + "&guide=0&intro=0", { media: ["min-width: 960px"] });
   const box = { M: null };
   if (o.scene) P.ctx.EvoScene = o.scene;
+  if (o.dash) {   /* (the dashboards' attach gets runConfig: the page's record of what runs) */
+    P.ctx.EvoDash = { attach: (h) => { box.host = h; }, pump() {}, reset() {}, ingest() {}, every: () => 60, open() {}, close() {}, isOpen: () => false };
+  }
   const load = o.load;
   P.ctx.EVO_ASSETS = { st: "evo_boids.js", stWasm: "evo_boids.wasm", mt: "evo_boids_mt.js", mtWasm: "evo_boids_mt.wasm", worker: "worker.js", background: "rocks.jpg", three: "three.js" };
   P.ctx.EvoLoader = { load: load || (() => mkClassic().then((m) => { box.M = m; return { Module: m, threaded: false, why: "the test", js: "evo_boids.js", wasm: "evo_boids.wasm" }; })),
@@ -562,17 +575,125 @@ async function reviewRecord() {
   ok(G.said() === "Energy burned per second is now 1.7 (live)" && Math.abs(configOf(M).metabolicRate - 1.7) < 1e-6, "  1.7 (a float the engine keeps as 1.70000005): said as 1.7", G.said());
 }
 
-(async () => {
-  try {
-    await workerSet();
-    const G = await pageRules();
-    await turboEdits(G);
-    await engineTrap(G);
-    await startFailures();
-    for (const t of [reviewLoadBypass, reviewStoppedFence, reviewUnanswered, reviewHeldOrder, reviewFrameErrors, reviewRecord]) {
-      try { await t(); } catch (e) { ok(false, t.name + " threw: " + (e && e.stack || e)); }   /* (one case's throw never hides the next) */
+/* ================================================ 6. the second review of PR #104 (fe5f9e6) ================================================ */
+const LIVE_FLOATS = ["foodSpawnBase", "foodSpawnAmp", "foodEnergy", "metabolicRate", "moveCost", "geneCost", "maxAge", "reproEnergy",
+                     "newbornEnergy", "mutationMultiplier", "minSpeed", "maxSpeed", "predatorTraitMutation"];
+const LIVE_INTS = ["maxPopulation", "minPopulation", "targetFood", "predatorMinPopulation", "predatorMaxPopulation"];
+/* the engine's own number for a key, from its checkpoint's text (no JSON.parse: a world that overflowed writes "inf") */
+const engineNum = (M, k) => { const m = new RegExp('"' + k + '":\\s*([^,}\\s]+)').exec(M.UTF8ToString(M._evo_checkpoint())); return m ? Number(m[1]) : NaN; };
+/* two values the engine keeps as the same number: a float32 for the float keys, a whole number for the others */
+const sameKept = (k, a, b) => (LIVE_INTS.indexOf(k) >= 0 ? a === b : Math.fround(a) === Math.fround(b));
+
+/* P1: a live change the seven-digit display hides is still a change: the run's history and the question count it */
+async function reviewRounding() {
+  section("6a. P1: two values that print the same at seven digits but run as two (1.5 and 1.5000001)");
+  const G = await startedPage({ dash: true }), { el, box } = G, M = box.M;
+  ok(Math.fround(1.5) !== Math.fround(1.5000001) && +Math.fround(1.5000001).toPrecision(7) === 1.5, "the pair: float32 1.5 and 1.50000012, both 1.5 at seven digits");
+  G.setField("adv_metabolicRate", 1.5000001);
+  ok(engineNum(M, "metabolicRate") === 1.50000012 && G.said() === "Energy burned per second is now 1.5000001 (live)",
+     "Energy burned per second 1.5000001: the engine runs 1.50000012 (another number than 1.5), and the note says 1.5000001, not 1.5", G.said());
+  ok(/live/.test(el("modeline").dataset.why || ""), "  the run's history has it: it no longer replays from its seed (data-why " + JSON.stringify(el("modeline").dataset.why) + ")");
+  G.P.key("r"); G.settle();
+  ok(G.asked() && el("startaskmsg").textContent === "This replaces your run. Your live tweak (Energy burned per second 1.5000001) carries over to the new world.",
+     "  R on that fresh run asks (a live tweak), and names it as it runs", el("startaskmsg").textContent);
+  G.P.key("Escape");
+  G.setField("adv_metabolicRate", 1.5);
+  G.P.key("r"); G.settle();
+  ok(!G.asked(), "set back to 1.5 (the value it started with): no live tweak, R starts at once");
+}
+
+/* the page's record of what runs, after every live value, against the engine's own (the rule the page keeps it by:
+ * renderer.js engineVal / applyRule, with no read of the world but for the speeds and the predator floor) */
+async function reviewRecordRule() {
+  section("6b. the page's record of each live value is the engine's, value for value (read back only where the engine's clamps can move it)");
+  const G = await startedPage({ dash: true }), { el, box } = G, M = box.M;
+  const floats = [0.1, 1.7, 1.5000001, 123456.789, 0.00007, 7.000000000001, 0.00006103515625, 1e-40, 3.4e38, 40, 175];
+  const ints = [0, 7, 123456789, 999999999, 30];
+  let n = 0;
+  const bad = [];
+  for (const k of LIVE_FLOATS.concat(LIVE_INTS)) {
+    for (const v of (LIVE_INTS.indexOf(k) >= 0 ? ints : floats)) {
+      G.setField("adv_" + k, v);
+      n++;
+      const rec = box.host.runConfig(), cfg = configOf(M);
+      for (const kk of LIVE_FLOATS.concat(LIVE_INTS)) {
+        if (kk === "maxPopulation") continue;   /* (its record is the user's cap, the governor's combined into the engine's) */
+        const r = Object.prototype.hasOwnProperty.call(rec, kk) ? rec[kk] : undefined;
+        if (r === undefined || !sameKept(kk, r, cfg[kk])) bad.push([k, v, kk, r, cfg[kk]]);
+      }
     }
-  } catch (e) { ok(false, "the run threw: " + (e && e.stack || e)); }
+  }
+  ok(n > 100 && bad.length === 0, "after each of " + n + " live values (every live key, floats from 1e-40 to 3.4e38, nine-digit whole numbers): every live key of the page's record is the engine's", bad.slice(0, 4));
+}
+
+/* P2: a value the engine cannot keep is refused before it is applied, here and in Turbo; a world whose state overflowed
+ * (a checkpoint that is not JSON) is contained on every path: here, in the worker, in its recovery, at the hand-back */
+async function reviewOverflow() {
+  section("6c. P2: values the engine cannot keep are refused first; a world that overflowed is contained everywhere");
+  const G = await startedPage({ dash: true }), { D, el, box } = G, M = box.M;
+  G.setField("adv_metabolicRate", 1e39);
+  ok(G.said() === "Energy burned per second is too large for the engine (it keeps 32-bit numbers, at most about 3.4e38) (the running world keeps 1.5)." &&
+     el("adv_metabolicRate").value === "1.5" && configOf(M).metabolicRate === 1.5 && D.errors.length === 0,
+     "here: Energy burned per second 1e39 (finite, past float32) refused before it reaches the engine, the field back to 1.5, the world's checkpoint still JSON", [G.said(), D.errors.slice(0, 1)]);
+  G.setField("adv_targetFood", 1e12);
+  ok(G.said() === "Food target is too large for the engine (it keeps whole numbers of up to nine digits) (the running world keeps 600)." && configOf(M).targetFood === 600,
+     "  Food target 1e12 (the engine would cap it at 2147483647 without a word): refused the same way", G.said());
+  el("turbobtn").click();
+  await until(() => G.state() === "turbo", "Turbo running");
+  const w = workers[workers.length - 1], sets0 = w.sets || 0;
+  G.setField("adv_metabolicRate", 1e39);
+  ok((w.sets || 0) === sets0 && /too large for the engine/.test(G.said()) && el("adv_metabolicRate").value === "1.5", "in Turbo: refused by the page, nothing sent to the worker");
+  el("turboexit").click();
+  await until(() => G.state() === "live", "the hand-back");
+  ok(configOf(M).metabolicRate === 1.5 && D.errors.length === 0, "  after the hand-back the engine runs 1.5");
+
+  /* a world whose state overflowed: a food energy near float32's top, a few meals later "inf" in the checkpoint */
+  G.setField("adv_foodEnergy", 3e38);
+  const playing = () => el("pausebtn").getAttribute("aria-label") !== "play";
+  if (!playing()) el("pausebtn").click();
+  let steps = 0, json = true;
+  for (; steps < 600 && json; steps++) { G.P.frame(); try { JSON.parse(M.UTF8ToString(M._evo_checkpoint())); } catch (e) { json = false; } }
+  if (playing()) el("pausebtn").click();
+  G.settle();
+  ok(!json, "Energy per food 3e38 (finite, accepted), " + steps + " frames: a fish's energy overflowed, the world's checkpoint is not JSON any more");
+  G.setField("adv_targetFood", 700);
+  ok(G.said() === "Food target is now 700 (live)" && engineNum(M, "targetFood") === 700 && box.host.runConfig().targetFood === 700 && D.errors.length === 0,
+     "here, a plain value (Food target 700): applied and said, nothing read, nothing thrown");
+  /* (the speeds as the page records them and as the engine runs them: the same pair) */
+  const speeds = () => { const r = box.host.runConfig(); return [Math.fround(r.minSpeed), Math.fround(r.maxSpeed), Math.fround(engineNum(M, "minSpeed")), Math.fround(engineNum(M, "maxSpeed"))]; };
+  const agree = () => { const v = speeds(); return v[0] === v[2] && v[1] === v[3]; };
+  G.setField("adv_minSpeed", 200);   /* (above Fastest, 150: the engine swaps them, so the page reads its config, which fails) */
+  ok(/^The engine took Slowest speed, but its state can't be read back \(.*a number in the world overflowed\): the page goes by what it gave it\.$/.test(G.said()) &&
+     agree() && speeds()[0] === 150 && speeds()[1] === 200 && D.errors.length === 0,
+     "here, a value the engine's clamps move (Slowest speed 200, above 150): the read fails, contained and said; the record mirrors the swap (150 / 200), as the engine runs", [G.said(), speeds(), D.errors.slice(0, 1)]);
+  el("turbobtn").click();
+  await until(() => G.state() === "turbo", "Turbo running on the overflowed world");
+  G.setField("adv_maxSpeed", 140);   /* (below Slowest, 150: swapped; the worker reads back, which fails there) */
+  await until(() => Math.fround(box.host.runConfig().minSpeed) === Math.fround(140), "the worker's answer (Fastest speed 140)");
+  ok(D.errors.length === 0 && speeds()[0] === Math.fround(140) && speeds()[1] === 150,
+     "in Turbo, Fastest speed 140 (below 150): the worker's read fails there, contained (no throw); the record mirrors the swap (140 / 150)", speeds());
+  G.setField("adv_minSpeed", 175);   /* (above Fastest: swapped, read back; the worker dies before it answers) */
+  workers[workers.length - 1].onerror({ message: "injected: the worker died" });
+  await new Promise((r) => setTimeout(r, 20));
+  ok(G.state() === "live" && agree() && speeds()[0] === 150 && speeds()[1] === 175 && D.errors.length === 0,
+     "the worker dead before its answer: the recovered world takes Slowest speed 175 (its read fails: contained), the record and the engine agree (150 / 175)", [speeds(), D.errors.slice(0, 1)]);
+  el("turbobtn").click();
+  await until(() => G.state() === "turbo", "Turbo once more");
+  el("turboexit").click();
+  await until(() => G.state() === "live", "a hand-back of the overflowed world");
+  ok(D.errors.length === 0 && agree() && /^Turbo ran [\d,]+ steps\.$|can't be read back/.test(G.said()),
+     "  its hand-back: the world loads, its unreadable config contained (the record stays the page's, and agrees), nothing thrown", G.said());
+}
+
+(async () => {
+  /* each section on its own: one section's throw never hides the next (sections 3 and 4b go on section 2's page) */
+  const run = async (name, f) => { try { return await f(); } catch (e) { ok(false, name + " threw: " + (e && e.stack || e)); return null; } };
+  await run("workerSet", workerSet);
+  const G = await run("pageRules", pageRules);
+  if (G) { await run("turboEdits", () => turboEdits(G)); await run("engineTrap", () => engineTrap(G)); }
+  await run("startFailures", startFailures);
+  for (const t of [reviewLoadBypass, reviewStoppedFence, reviewUnanswered, reviewHeldOrder, reviewFrameErrors, reviewRecord,
+                   reviewRounding, reviewRecordRule, reviewOverflow]) await run(t.name, t);
   for (const w of workers) w.terminate();
   console.log((fails ? "FAILED " + fails + " of " : "all ") + checks + " checks" + (fails ? "" : " passed"));
   process.exit(fails ? 1 : 0);
