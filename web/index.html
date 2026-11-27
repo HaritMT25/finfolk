@@ -515,8 +515,9 @@
   @keyframes swim { from { transform: translateX(-100%); } to { transform: translateX(260%); } }
   /* a failed start, or the engine stopped mid-run (renderer.js failScreen, the Ocean's): the bar stops, the error in
    * red, and the ways on (the 3-D Ocean, Reload) */
-  #splash.failed { padding: 20px; }
+  #splash.failed { padding: 20px; transition: none; }   /* (at once: a fading splash is still hidden, and its first way could not take the focus) */
   #splash.failed .swim { display: none; }
+  #splash.failed p { margin-inline: auto; }   /* (the error widens the column: the line under the name stays centred) */
   #splashstate.error { color: var(--ember); text-align: left; white-space: pre-wrap; max-width: 60ch; }
   #splash .splash-acts { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-top: 18px; }
   #splash .splash-acts .btn { text-decoration: none; }
