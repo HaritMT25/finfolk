@@ -295,7 +295,7 @@
     var f = screenWorld();
     setVal("width", f[0]); setVal("height", f[1]);
     updateNeeds(); updateTabDots(); renderStartBar();
-    setDrawer(true);
+    layers.setDrawer(true);
     showNote("The tank's size for this screen, " + f[0] + " × " + f[1] + ", waits for the next start: Start applies it.");
   }
   /* the tank's sides: glass walls in the running world (oc_walls_enabled), and
@@ -382,14 +382,14 @@
   var runRecipe = null;
   var usedTurbo = false;     /* Turbo ran this world (a reason to ask before replacing it) */
   var inspector = EvoOceanInspector.create({
-    el: el, has: has, syncedFrame: syncedFrame, turboPictureHint: turboPictureHint, engineCall: engineCall, fresh: fresh, setStatPanel: setStatPanel, cfgVal: cfgVal, STATS: STATS, ACTION_SHORT: ACTION_SHORT, ACTION_LABELS: ACTION_LABELS, coarseMQ: coarseMQ, heap: heap, cString: cString, toast: toast,
+    el: el, has: has, syncedFrame: syncedFrame, turboPictureHint: turboPictureHint, engineCall: engineCall, fresh: fresh, cfgVal: cfgVal, STATS: STATS, ACTION_SHORT: ACTION_SHORT, ACTION_LABELS: ACTION_LABELS, coarseMQ: coarseMQ, heap: heap, cString: cString, toast: toast,
     get M() { return M; },
     get engineState() { return engineState; },
     get turboState() { return turboState; },
     get lastS() { return lastS; },
     get scene() { return scene; },
     get display() { return display; },
-    get statOpen() { return statOpen; },
+    get layers() { return layers; },
     get paused() { return paused; },
     get BODY_LAYOUT() { return BODY_LAYOUT; },
     get HO() { return HO; },
@@ -398,8 +398,6 @@
     get W() { return W; },
     get H() { return H; },
     get D() { return D; },
-    get cardNewer() { return cardNewer; }, set cardNewer(v) { cardNewer = v; },
-    get cardHeld() { return cardHeld; }, set cardHeld(v) { cardHeld = v; },
     get readouts() { return readouts; },
     hideCoach: function () { tour.hideCoach(); }
   });
@@ -769,7 +767,7 @@
     if (LIVE[key]) input.addEventListener("change", fenced(function () { applyLive(key); }));
     row.appendChild(left);
     row.appendChild(ctl);
-    attachTip(row, key);
+    layers.attachTip(row, key);
     return row;
   }
   /* a field's value as typed: a whole-number setting (opt.int) is never
@@ -1093,7 +1091,7 @@
     sheetTabs.mark(id);
     CFG.TABS.forEach(function (tab) { el("panel-" + tab.id).hidden = tab.id !== id; });
     panelsEl.scrollTop = 0;
-    hideTip();
+    layers.hideTip();
     store("evo_boids.ocean.tab", id);
   }
   function updateTabDots() {
@@ -1316,7 +1314,7 @@
       draft ? (draft.id === "surprise" ? "Start this draw" : "Start " + draft.title) : n ? "Start with " + (n === 1 ? "the change" : "the " + n + " changes") : "Start again";
     b.classList.toggle("pending", !!draft || n > 0 || turbo);
     el("startdiscard").hidden = !(draft || n);
-    drawerEl.classList.toggle("staging", !!draft);
+    layers.drawerEl.classList.toggle("staging", !!draft);
     panelsEl.querySelectorAll(".staging-banner").forEach(function (banner) {
       banner.hidden = !draft;
       banner.querySelector("span").textContent = draft
@@ -1366,7 +1364,7 @@
      * its Start, at a place the strip snaps to (its start), so it stays there */
     var card = pickedId ? el(CARD_IDS[pickedId]).parentNode : null;
     if (!card) cardShown = null;
-    else if (pickedId !== cardShown && drawerEl.classList.contains("open") && card.scrollIntoView) {   /* (a closed sheet: nothing to scroll) */
+    else if (pickedId !== cardShown && layers.drawerEl.classList.contains("open") && card.scrollIntoView) {   /* (a closed sheet: nothing to scroll) */
       cardShown = pickedId;
       try { card.scrollIntoView({ block: "nearest", inline: "start" }); } catch (e) { /* old */ }
     }
@@ -1616,7 +1614,7 @@
     el("startask").hidden = false;
     el("applybar").classList.add("asking");
     setStartMenu(false);
-    if (!drawerEl.classList.contains("open")) setDrawer(true);
+    if (!layers.drawerEl.classList.contains("open")) layers.setDrawer(true);
   }
   function hideAsk() {
     asking = null;
@@ -2293,7 +2291,7 @@
   var fpsFrames = 0, fpsT = 0, fps = 0;
   var governorOn = !BENCH;
   var display = EvoOceanDisplay.create({
-    el: el, has: has, inspector: inspector, syncedFrame: syncedFrame, toast: toast, coarseMQ: coarseMQ, updateKeysLegend: updateKeysLegend, store: store, pointerBlur: pointerBlur, P: P, BENCH: BENCH, engineCall: engineCall, setPop: setPop, setDrawer: setDrawer, setSheetTab: setSheetTab, changedKeys: changedKeys, setHtml: setHtml,
+    el: el, has: has, inspector: inspector, syncedFrame: syncedFrame, toast: toast, coarseMQ: coarseMQ, updateKeysLegend: updateKeysLegend, store: store, pointerBlur: pointerBlur, P: P, BENCH: BENCH, engineCall: engineCall, get layers() { return layers; }, setSheetTab: setSheetTab, changedKeys: changedKeys, setHtml: setHtml,
     get M() { return M; },
     get scene() { return scene; },
     get HAS_APP() { return HAS_APP; },
@@ -2305,14 +2303,13 @@
     get historyUnknown() { return historyUnknown; }
   });
   var readouts = EvoOceanReadouts.create({
-    el: el, DT: DT, has: has, fresh: fresh, STATS: STATS, updateKeysLegend: updateKeysLegend, showSpeedCap: showSpeedCap, speed: speed, setHtml: setHtml, setTxt: setTxt, fmtInt: fmtInt, fmtTime: fmtTime, inspector: inspector, display: display, heap: heap, cString: cString, turboWiring: turboWiring, engineCall: engineCall, setDrawer: setDrawer, setPop: setPop,
+    el: el, DT: DT, has: has, fresh: fresh, STATS: STATS, updateKeysLegend: updateKeysLegend, showSpeedCap: showSpeedCap, speed: speed, setHtml: setHtml, setTxt: setTxt, fmtInt: fmtInt, fmtTime: fmtTime, inspector: inspector, display: display, heap: heap, cString: cString, turboWiring: turboWiring, engineCall: engineCall, get layers() { return layers; },
     get D() { return D; },
     get M() { return M; },
     get HO() { return HO; },
     get turboState() { return turboState; },
     get turboView() { return turboView; },
     get fps() { return fps; },
-    get statOpen() { return statOpen; },
     get initArgs() { return initArgs; },
     get paused() { return paused; },
     get lastSteps() { return lastSteps; },
@@ -2373,55 +2370,26 @@
 
   display.initLight();
 
-  /* ---- the View menu and Help: one popover at a time; ×, Esc, its key or a
-   * press outside closes it. [popover, trigger, its first control] ---- */
-  var POPS = { view: ["viewpop", "viewmenubtn", "lightnow"], help: ["helppop", "helpbtn", "tourbtn"] }, openPop = null, popOpener = UI.returnPoint();
+  var layers = EvoOceanLayers.create({
+    el: el, UI: UI, wideMQ: wideMQ, compactMQ: compactMQ, setStartMenu: setStartMenu, hideAsk: hideAsk,
+    get scene() { return scene; },
+    get asking() { return asking; },
+    get lastPointer() { return lastPointer; },
+    get panelsEl() { return panelsEl; },
+    get CFG() { return CFG; },
+    get readouts() { return readouts; },
+    get tour() { return tour; }
+  });
+  layers.initPop();
   /* A press by the keyboard (its focus ring showing) keeps the focus; a
    * pointer's lets it go, so Space goes back to pausing (web/ui_common.js). */
   function pointerBlur(n) { UI.pointerBlur(n); }
-  /* opener: the trigger, when the keyboard pressed it (else null): the focus
-   * goes to the popover's first control, and back to the trigger when the
-   * keyboard closes it (closePop: the return point, web/ui_common.js). Each
-   * opening replaces it, so only the open popover's is ever restored. */
-  function setPop(name, opener) {
-    openPop = POPS[name] ? name : null;
-    if (openPop) popOpener.set(opener);
-    Object.keys(POPS).forEach(function (n) {
-      el(POPS[n][0]).hidden = n !== openPop;
-      el(POPS[n][1]).setAttribute("aria-expanded", n === openPop ? "true" : "false");
-    });
-    document.body.classList.toggle("help-open", openPop === "help");
-    if (openPop) {
-      /* never under a layer above it: the charts, a narrow screen's settings sheet */
-      if (readouts.dash() && readouts.dash().isOpen()) readouts.dash().close();
-      if (!wideMQ.matches && drawerEl.classList.contains("open")) setDrawer(false);
-      setStatPanel(false); tour.hideCoach(); placePop();
-      if (popOpener.get()) el(POPS[openPop][2]).focus();
-    }
-  }
-  function closePop(keyboard) {
-    setPop(null);
-    popOpener.restore(keyboard);
-  }
-  function togglePop(name, opener, keyboard) { if (openPop === name) closePop(keyboard); else setPop(name, opener); }
-  /* the View menu over its button, left of a wide screen's settings panel (a
-   * phone: the screen's width, from the CSS) */
-  function placePop() {
-    var pop = el("viewpop");
-    if (openPop !== "view" || innerWidth < 600) { pop.style.left = ""; return; }
-    var r = el("viewmenubtn").getBoundingClientRect(), w = pop.offsetWidth;
-    var right = wideMQ.matches && drawerEl.classList.contains("open") ? drawerEl.getBoundingClientRect().left : innerWidth;
-    pop.style.left = Math.round(Math.max(10, Math.min(right - w - 10, r.left + r.width / 2 - w / 2))) + "px";
-  }
-  document.addEventListener("pointerdown", function (e) {
-    if (openPop && !e.target.closest("#" + POPS[openPop][0] + ", #" + POPS[openPop][1])) setPop(null);
-  });
+  layers.registerPopOutside();
 
   var tour = EvoOceanTour.create({
     store: store, P: P, el: el, coarseMQ: coarseMQ,
-    readouts: readouts, enterTurbo: enterTurbo, setDrawer: setDrawer, setSheetTab: setSheetTab, engineCall: engineCall, fresh: fresh,
-    get turboState() { return turboState; }, get openPop() { return openPop; },
-    get statOpen() { return statOpen; }, get drawerEl() { return drawerEl; },
+    readouts: readouts, enterTurbo: enterTurbo, layers: layers, setSheetTab: setSheetTab, engineCall: engineCall, fresh: fresh,
+    get turboState() { return turboState; },
     get HAS_APP() { return HAS_APP; },
     get M() { return M; }, get lastS() { return lastS; }, get scene() { return scene; },
     inspector: inspector, display: display
@@ -2434,28 +2402,7 @@
   function fmtTime(s) { s = Math.max(0, Math.round(s)); var m = Math.floor(s / 60); return m ? m + " min " + (s % 60) + " s" : s + " s"; }
   function setHtml(id, html) { var e = el(id); if (e && e._v !== html) { e._v = html; e.innerHTML = html; } }
   function setTxt(id, t) { var e = el(id); if (e && e._v !== t) { e._v = t; e.textContent = t; } }
-  var statOpen = false;
-  /* The live numbers and a fish card where they overlap (a phone; a card
-   * flipped to the top; its brain open): the newer shows (updateCard). The
-   * numbers opened over a card hide it until they close (cardHeld), its
-   * fish still selected, followed and lit; a fish picked while they are open
-   * (cardNewer) closes them. */
-  var cardNewer = false, cardHeld = false;
-  function setStatPanel(open) {
-    statOpen = open;
-    cardNewer = false; cardHeld = false;
-    el("statpanel").hidden = !open;
-    el("readout").setAttribute("aria-expanded", open ? "true" : "false");
-    document.body.classList.toggle("stat-open", open);   /* the Fit button, where it would cover its first rows, waits (ocean.html) */
-    /* opening, as a popover does (setPop): never under the charts or a narrow
-     * screen's settings sheet; no popover over it; the coach mark goes */
-    if (open) {
-      if (readouts.dash() && readouts.dash().isOpen()) readouts.dash().close();
-      if (!wideMQ.matches && drawerEl.classList.contains("open")) setDrawer(false);
-      setPop(null); tour.hideCoach();
-    }
-    readouts.dirtyHud = true;
-  }
+  layers.initStats();
 
   inspector.initCard();
   inspector.initSwatch();
@@ -2904,11 +2851,11 @@
         /* the tour or the charts take this Esc themselves (escHandledElsewhere),
          * and nothing behind them closes with it; else the popover (back to its
          * opener), the settings, the live numbers, or the fish */
-        if (openPop) { if (!escHandledElsewhere) closePop(true); return; }
+        if (layers.openPop) { if (!escHandledElsewhere) layers.closePop(true); return; }
         if (!escHandledElsewhere && startMenuOpen()) { setStartMenu(false); el("startmenubtn").focus(); return; }   /* the start menu first, then the sheet */
         if (!escHandledElsewhere) {
-          if (drawerEl.classList.contains("open")) setDrawer(false);
-          else if (statOpen) setStatPanel(false);
+          if (layers.drawerEl.classList.contains("open")) layers.setDrawer(false);
+          else if (layers.statOpen) layers.setStatPanel(false);
           else if (scene.following()) inspector.unfollow();
           else { inspector.select(null); if (inspector.turboReturn) { inspector.turboReturn = null; showNote("Let go: no fish to pick up after Turbo."); } }
         }
@@ -2933,12 +2880,12 @@
       if (e.repeat && /^[?vtgoil]$/.test(lk)) return;   /* a held toggle acts once (the camera and speed keys repeat) */
       /* ? and V open as their buttons do from the keyboard: the focus into the
        * popover, and back to the button when it closes */
-      if (k === "?") { togglePop("help", el(POPS.help[1]), true); return; }
-      if (lk === "v") { togglePop("view", el(POPS.view[1]), true); return; }
+      if (k === "?") { layers.togglePop("help", el(layers.POPS.help[1]), true); return; }
+      if (lk === "v") { layers.togglePop("view", el(layers.POPS.view[1]), true); return; }
       if (lk === "t") { toggleTurbo(); return; }
-      if (lk === "g") { setPop(null); el("dashbtn").click(); return; }
-      if (lk === "o") { setPop(null); setDrawer(!drawerEl.classList.contains("open")); return; }
-      if (lk === "i") { setPop(null); setStatPanel(!statOpen); return; }
+      if (lk === "g") { layers.setPop(null); el("dashbtn").click(); return; }
+      if (lk === "o") { layers.setPop(null); layers.setDrawer(!layers.drawerEl.classList.contains("open")); return; }
+      if (lk === "i") { layers.setPop(null); layers.setStatPanel(!layers.statOpen); return; }
       /* the view: always */
       if (lk === "c") { inspector.wantFollow = false; scene.resetView(true); if (inspector.turboReturn) inspector.turboReturn.follow = false; return; }
       if (lk === "l") { display.toggleLight(); return; }
@@ -2991,136 +2938,18 @@
     });
     var fitTimer = 0;
     window.addEventListener("resize", function () {
-      scene.resize(); updateInsets();
+      scene.resize(); layers.updateInsets();
       clearTimeout(fitTimer);
-      fitTimer = setTimeout(function () { updateFitButton(); updateInsets(); placePop(); tour.placeCoach(); }, 250);
+      fitTimer = setTimeout(function () { updateFitButton(); layers.updateInsets(); layers.placePop(); tour.placeCoach(); }, 250);
     });
     if (reducedMQ.addEventListener) reducedMQ.addEventListener("change", function () { scene.setReducedMotion(reducedMQ.matches); });
   }
-  /* The part of the screen the tank is framed in (renderer.js updateInsets):
-   * below the top bar and above the dock on a desktop, the whole screen on
-   * compact ones, where the controls float over it; less the open settings. */
-  function updateInsets() {
-    if (!scene) return;
-    var vh = window.innerHeight, open = drawerEl.classList.contains("open");
-    var top = 0, bottom = 0, right = 0;
-    if (!compactMQ.matches) {
-      top = el("topbar").getBoundingClientRect().bottom + 6;
-      bottom = vh - el("dock").getBoundingClientRect().top + 6;
-    }
-    if (open && wideMQ.matches) right = drawerEl.getBoundingClientRect().width;
-    else if (open) {
-      var sheetTop = drawerEl.getBoundingClientRect().top;
-      bottom = sheetTop - top >= vh * 0.3 ? vh - sheetTop : bottom;
-    }
-    scene.setInsets({ top: Math.round(top), right: Math.round(right), bottom: Math.round(Math.max(0, bottom)), left: 0 });
-  }
 
-  /* ---- settings: a bottom sheet on narrow screens, a side panel on wide ones ---- */
-  var drawerEl = el("drawer"), menuBtn = el("menubtn");
-  function setDrawer(open) {
-    if (open && readouts.dash()) readouts.dash().close();
-    drawerEl.classList.toggle("open", open);
-    document.body.classList.toggle("sheet-open", open);
-    menuBtn.setAttribute("aria-expanded", open ? "true" : "false");
-    if (!open) { hideTip(); setStartMenu(false); if (asking) hideAsk(); }   /* a question no one can see is no question: closing the sheet keeps the run */
-    if (open) { setStatPanel(false); setPop(null); tour.hideCoach(); }
-    if (scene) { updateInsets(); setTimeout(updateInsets, 320); }
-  }
-  /* Crossing 960 px (a resize, a rotation): a wide screen lets the settings
-   * panel stay beside a popover or the live numbers, a narrow one's sheet
-   * would cover them (and hide the dock under the View menu). What opened
-   * last stays — a popover or the live numbers, since opening the settings
-   * closes both — so the sheet closes, as it would have on this screen
-   * (setPop, setStatPanel); the focus, if it was in the sheet, goes to the
-   * popover's first control, else to the settings button. */
-  function onWideChange() {
-    if (!wideMQ.matches && drawerEl.classList.contains("open") && (openPop || statOpen)) {
-      var inSheet = drawerEl.contains(document.activeElement);
-      setDrawer(false);
-      if (inSheet) (openPop ? el(POPS[openPop][2]) : menuBtn).focus();
-    }
-    placePop();
-  }
-  if (wideMQ.addEventListener) wideMQ.addEventListener("change", onWideChange);
-  else if (wideMQ.addListener) wideMQ.addListener(onWideChange);   /* Safari before 14 */
-  menuBtn.addEventListener("click", function () { setDrawer(!drawerEl.classList.contains("open")); this.blur(); });
-  el("drawerclose").addEventListener("click", function () { setDrawer(false); this.blur(); });
-  (function () {   /* drag the sheet's grip (or header) down to close it */
-    var start = null, grip = el("grip"), head = drawerEl.querySelector(".sheet-head");
-    function down(e) {
-      if (wideMQ.matches || e.target.closest("button")) return;
-      start = { y: e.clientY, id: e.pointerId, dy: 0 };
-      drawerEl.classList.add("dragging");
-      e.currentTarget.setPointerCapture(e.pointerId);
-    }
-    function move(e) {
-      if (!start || e.pointerId !== start.id) return;
-      start.dy = Math.max(0, e.clientY - start.y);
-      drawerEl.style.transform = "translateY(" + start.dy + "px)";
-    }
-    function up(e) {
-      if (!start || e.pointerId !== start.id) return;
-      drawerEl.classList.remove("dragging");
-      drawerEl.style.transform = "";
-      if (start.dy > Math.min(120, drawerEl.offsetHeight * 0.25)) setDrawer(false);
-      start = null;
-    }
-    [grip, head].forEach(function (n) {
-      n.addEventListener("pointerdown", down); n.addEventListener("pointermove", move);
-      n.addEventListener("pointerup", up); n.addEventListener("pointercancel", up);
-    });
-  })();
-  el("readout").addEventListener("click", function () { setStatPanel(!statOpen); this.blur(); });
-  document.addEventListener("pointerdown", function (e) {
-    if (statOpen && !e.target.closest("#statpanel, #readout")) setStatPanel(false);
-  });
+  layers.initDrawer();
+  layers.registerDrawer();
 
-  /* ---- the shared hover tooltip (renderer.js's) ---- */
-  var tipEl = document.createElement("div");
-  tipEl.id = "tooltip";
-  var tipDesc = document.createElement("div"); tipDesc.className = "tipd";
-  var tipTry = document.createElement("div"); tipTry.className = "tipt";
-  tipEl.appendChild(tipDesc); tipEl.appendChild(tipTry);
-  document.body.appendChild(tipEl);
-  var tipTimer = 0, tipFor = null;
-  function hideTip() { clearTimeout(tipTimer); tipEl.style.display = "none"; tipFor = null; }
-  function showTip(rowEl, tip) {
-    tipDesc.textContent = tip.d; tipTry.textContent = tip.t;
-    tipEl.style.display = "block";
-    tipFor = rowEl;
-    var dr = drawerEl.getBoundingClientRect(), lr = rowEl.getBoundingClientRect(), left, top;
-    if (wideMQ.matches && dr.left >= tipEl.offsetWidth + 16) {
-      left = Math.max(6, dr.left - 10 - tipEl.offsetWidth);
-      top = lr.top + lr.height / 2 - tipEl.offsetHeight / 2;
-    } else {
-      left = Math.max(8, Math.min(lr.left, window.innerWidth - tipEl.offsetWidth - 8));
-      top = lr.bottom + 4;
-      if (top + tipEl.offsetHeight > window.innerHeight - 6) top = lr.top - 4 - tipEl.offsetHeight;
-    }
-    top = Math.max(6, Math.min(top, window.innerHeight - tipEl.offsetHeight - 6));
-    tipEl.style.left = left + "px"; tipEl.style.top = top + "px";
-  }
-  function attachTip(rowEl, key) {
-    var tip = CFG.TIPS[key];
-    if (!tip || !rowEl) return;
-    rowEl.addEventListener("mouseenter", function () {
-      if (lastPointer !== "mouse") return;
-      clearTimeout(tipTimer);
-      tipTimer = setTimeout(function () { showTip(rowEl, tip); }, 200);
-    });
-    rowEl.addEventListener("mouseleave", function () { if (lastPointer === "mouse") hideTip(); });
-    var name = rowEl.querySelector(".lt");
-    if (name) name.addEventListener("click", function (e) {
-      if (lastPointer === "mouse") return;
-      e.preventDefault();
-      if (tipFor === rowEl) hideTip(); else showTip(rowEl, tip);
-    });
-  }
-  panelsEl.addEventListener("scroll", hideTip);
-  document.addEventListener("pointerdown", function (e) {
-    if (tipFor && e.pointerType !== "mouse" && !(e.target.closest && e.target.closest(".lt"))) hideTip();
-  });
+  layers.initTips();
+  layers.registerTips();
 
   /* ---- buttons ---- */
   /* (each button's press fenced whole: Close, Follow, Replay, Start, Turbo, ...) */
@@ -3186,15 +3015,15 @@
   askBtn("replay", function () { setStartMenu(false); replay(); }, "startmenubtn");
   btn("lightbtn", display.toggleLight);
   ["view", "help"].forEach(function (n) {   /* the triggers; × closes (pointerBlur, setPop: the focus) */
-    el(POPS[n][1]).addEventListener("click", function () {
+    el(layers.POPS[n][1]).addEventListener("click", function () {
       var kb = UI.keyboardFocused(this);
-      togglePop(n, kb ? this : null, kb);
+      layers.togglePop(n, kb ? this : null, kb);
       if (!kb) this.blur();
     });
-    el(n + "close").addEventListener("click", function () { closePop(UI.keyboardFocused(this)); });
+    el(n + "close").addEventListener("click", function () { layers.closePop(UI.keyboardFocused(this)); });
   });
-  btn("tourbtn", function () { setPop(null); if (window.EvoGuide) EvoGuide.start(); });
-  btn("whatturbo", function () { setPop(null); if (window.EvoGuide && EvoGuide.turbo) EvoGuide.turbo(); });
+  btn("tourbtn", function () { layers.setPop(null); if (window.EvoGuide) EvoGuide.start(); });
+  btn("whatturbo", function () { layers.setPop(null); if (window.EvoGuide && EvoGuide.turbo) EvoGuide.turbo(); });
   el("to2dmenu").href = el("to2d").href;   /* the deploy build renames Classic's page in #to2d */
   display.wireLightSwitch();
   btn("viewbtn", function () { if (scene) { inspector.wantFollow = false; scene.resetView(true); if (inspector.turboReturn) inspector.turboReturn.follow = false; } });
@@ -3402,7 +3231,7 @@
     if (scene.setAppearance) scene.setAppearance(display.colourMode === "appearance");
     readouts.labelHist();
     wireInput();
-    updateInsets();
+    layers.updateInsets();
     display.updateLight();
     display.updateModeline();
     display.applyClarity();

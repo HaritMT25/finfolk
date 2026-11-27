@@ -91,7 +91,7 @@
     var was = selectedId;
     selectedId = id;
     if (id !== null) { everSelected = true; ports.hideCoach(); }   /* its card opens where the coach mark sits */
-    if (id !== null && id !== was && !handover) { ports.cardNewer = true; ports.cardHeld = false; }   /* its card, over the live numbers (updateCard) */
+    if (id !== null && id !== was && !handover) { ports.layers.cardNewer = true; ports.layers.cardHeld = false; }   /* its card, over the live numbers (updateCard) */
     /* the capture, only into a running engine (Close, Esc and the tour let go of a fish while it is stopped or
      * restarting too: review of #44, round 3, finding 3; a restarted one gets it with its run, applyDisplaySwitches) */
     if ((was === null) !== (id === null) && ports.M && ports.engineState === "ok" && ports.has("oc_set_capture")) {
@@ -217,16 +217,16 @@
   }
   /** @param {OceanSnapshot} s @returns {OceanSnapshot} */
   function updateCard(s) {
-    if (ports.cardHeld && ports.statOpen) { hideCard(); return s; }   /* under the live numbers: the fish stays selected */
+    if (ports.layers.cardHeld && ports.layers.statOpen) { hideCard(); return s; }   /* under the live numbers: the fish stays selected */
     var idx = s.selIdx, f = idx >= 0 && ports.turboState === "live" ? inspect(idx) : null;
     if (!f) { hideCard(); return s; }
     s = ports.fresh(s);   /* oc_inspect may have grown the memory */
     if (cardEl.hidden) showCard();
     var p = ports.scene.project(s, idx);
     if (p) placeCard(p.x, p.y);
-    if (ports.statOpen && overlap(cardEl.getBoundingClientRect(), ports.el("statpanel").getBoundingClientRect())) {
-      if (ports.cardNewer) ports.setStatPanel(false);   /* a fish picked over the numbers: its card */
-      else { ports.cardHeld = true; hideCard(); return s; }   /* the numbers opened over the card: they */
+    if (ports.layers.statOpen && overlap(cardEl.getBoundingClientRect(), ports.el("statpanel").getBoundingClientRect())) {
+      if (ports.layers.cardNewer) ports.layers.setStatPanel(false);   /* a fish picked over the numbers: its card */
+      else { ports.layers.cardHeld = true; hideCard(); return s; }   /* the numbers opened over the card: they */
     }
     var info = f.info, id = Math.round(info[0]);
     var rgb = [s.colors[3 * idx], s.colors[3 * idx + 1], s.colors[3 * idx + 2]];

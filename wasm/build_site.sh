@@ -42,7 +42,7 @@ SRC=(web/evo_boids.js web/evo_boids.wasm web/evo_boids_mt.js web/evo_boids_mt.wa
      web/worker.js img/rocks.jpg web/index.html web/vercel.json
      web/evo_ocean.js web/evo_ocean.wasm web/ocean.js web/ocean_scene.js web/ocean.html
      web/ocean_config.js web/ocean_dash.js web/ocean_worker.js web/ocean_appearance.js
-     web/ocean_readouts.js web/ocean_inspector.js web/ocean_display.js web/ocean_tour.js
+     web/ocean_readouts.js web/ocean_inspector.js web/ocean_display.js web/ocean_layers.js web/ocean_tour.js
      web/ocean_appearance_slots.js web/ocean_handoff.js web/ocean_perf.js web/ocean_shaders.js
      web/ocean_pose.js web/ocean_materials.js web/ocean_scene_parity.js
      web/ocean_bodyplan.html web/ocean_bodyplan.js tests/fixtures/ocean_body_fixture.json
@@ -82,6 +82,7 @@ OCCFG=$(publish web/ocean_config.js); OCDASH=$(publish web/ocean_dash.js)
 OCREADOUTS=$(publish web/ocean_readouts.js)
 OCINSPECTOR=$(publish web/ocean_inspector.js); OCTOUR=$(publish web/ocean_tour.js)
 OCDISPLAY=$(publish web/ocean_display.js)
+OCLAYERS=$(publish web/ocean_layers.js)
 OCWORKER=$(publish web/ocean_worker.js); OCAPP=$(publish web/ocean_appearance.js)
 OCHANDOFF=$(publish web/ocean_handoff.js)
 OCPERF=$(publish web/ocean_perf.js);  OCSLOTS=$(publish web/ocean_appearance_slots.js)
@@ -123,7 +124,7 @@ assert counts == (1,) * 13, ("index.html changed shape", counts)
 open(sys.argv[1], "w").write(out)
 PY
 
-# The Ocean page: its EVO_ASSETS block, its nineteen <script src> tags, the
+# The Ocean page: its EVO_ASSETS block, its twenty <script src> tags, the
 # shared stylesheet's <link>, and Classic's name in the switch and in the
 # old-link redirect. ocean.js loads the
 # engine (ocean / oceanWasm) and starts the Turbo worker (worker) from these,
@@ -163,8 +164,9 @@ out, n20 = re.subn(r'<script src="ocean_tour\.js"></script>', '<script src="$OCT
 out, n21 = re.subn(r'<script src="ocean_inspector\.js"></script>', '<script src="$OCINSPECTOR"></script>', out, count=1)
 out, n22 = re.subn(r'<script src="ocean_readouts\.js"></script>', '<script src="$OCREADOUTS"></script>', out, count=1)
 out, n23 = re.subn(r'<script src="ocean_display\.js"></script>', '<script src="$OCDISPLAY"></script>', out, count=1)
-counts = (n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, n11, n12, n13, n14, n15, n16, n17, n18, n19, n20, n21, n22, n23)
-assert counts == (1,) * 23, ("ocean.html changed shape", counts)
+out, n24 = re.subn(r'<script src="ocean_layers\.js"></script>', '<script src="$OCLAYERS"></script>', out, count=1)
+counts = (n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, n11, n12, n13, n14, n15, n16, n17, n18, n19, n20, n21, n22, n23, n24)
+assert counts == (1,) * 24, ("ocean.html changed shape", counts)
 open(sys.argv[1], "w").write(out)
 PY
 cp "$OUT/index.html" "$OUT/ocean.html"

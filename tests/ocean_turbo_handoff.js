@@ -296,7 +296,7 @@ const PAGE_SRC = (() => {
         '    get M() { return M; }, get turboState() { return turboState; }, get turboWorker() { return turboWorker; },\n' +
         '    get runCfg() { return runCfg; }, get initArgs() { return initArgs; }, get live() { return live; },\n' +
         '    get W() { return W; }, get H() { return H; }, get D() { return D; }, get WALLS() { return WALLS; },\n' +
-        '    get paused() { return paused; }, get openPop() { return openPop; }, get statOpen() { return statOpen; },\n' +
+        '    get paused() { return paused; }, get openPop() { return layers.openPop; }, get statOpen() { return layers.statOpen; },\n' +
         /* (typeof: a page from before UI-4 / UI-3 has none of these, so the new sections run against it and fail, not throw) */
         '    get worldEpoch() { return worldEpoch; }, get pendingStart() { return typeof pendingStart === "undefined" ? null : pendingStart; },\n' +
         '    get asking() { return typeof asking === "undefined" ? null : asking; },\n' +
@@ -683,7 +683,7 @@ async function bootPage(query, opts) {
     run('ui_common.js'); run('ocean_handoff.js');
     if (opts.perf) run('ocean_perf.js');
     run('ocean_scene_stub.js', opts.nogl ? SCENE_NOGL : opts.scene || SCENE_STUB); run('ocean_config.js');
-    run('charts_stub.js', CHARTS_STUB); run('ocean_dash.js'); run('ocean_readouts.js'); run('ocean_inspector.js'); run('ocean_display.js'); run('ocean_tour.js'); run('ocean.js', PAGE_SRC);
+    run('charts_stub.js', CHARTS_STUB); run('ocean_dash.js'); run('ocean_readouts.js'); run('ocean_inspector.js'); run('ocean_display.js'); run('ocean_layers.js'); run('ocean_tour.js'); run('ocean.js', PAGE_SRC);
     if (opts.guide) run('guide.js');
     page.ctx = ctx; page.doc = doc; page.Ev = Ev; page.T = ctx.__oceanPage; page.KEYS = ctx.EvoOceanConfig.KEYS;
     page.el = (id) => doc.getElementById(id);

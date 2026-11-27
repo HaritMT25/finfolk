@@ -18,8 +18,8 @@
     coachTimer = setInterval(function () {
       var t = (performance.now() - t0) / 1000, gen = p.readouts.summary ? p.readouts.summary[13] : 0;
       if (coachDone()) { clearInterval(coachTimer); return; }   /* Turbo used, or its card seen, meanwhile */
-      if (!(t >= 60 || (gen >= 1 && t >= 25)) || p.turboState !== "live" || p.openPop || p.statOpen || p.inspector.selectedId !== null || document.hidden ||
-          document.getElementById("guide") || p.drawerEl.classList.contains("open") || (p.readouts.dash() && /** @type {{ isOpen(): boolean }} */ (p.readouts.dash()).isOpen())) return;
+      if (!(t >= 60 || (gen >= 1 && t >= 25)) || p.turboState !== "live" || p.layers.openPop || p.layers.statOpen || p.inspector.selectedId !== null || document.hidden ||
+          document.getElementById("guide") || p.layers.drawerEl.classList.contains("open") || (p.readouts.dash() && /** @type {{ isOpen(): boolean }} */ (p.readouts.dash()).isOpen())) return;
       clearInterval(coachTimer);
       p.store(COACH_KEY, "1");
       p.el("coach").hidden = false;
@@ -163,7 +163,7 @@
     startTurbo: function () { if (p.M && p.turboState === "live") p.enterTurbo(); },
     /* the Turbo card's tour step (web/guide.js) asks this; Classic's page has its #turbo card instead */
     turboActive: function () { return p.turboState !== "live"; },
-    setDrawer: p.setDrawer,
+    setDrawer: p.layers.setDrawer,
     setSheetTab: p.setSheetTab,
     inspectSomeFish: function () {
       return p.engineCall(function () {

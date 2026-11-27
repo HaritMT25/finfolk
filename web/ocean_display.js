@@ -124,7 +124,7 @@
   });
   ports.el("colourwhy").addEventListener("click", function (e) {   /* "Setup › Life › Appearance genes" */
     if (!/** @type {Element} */ (e.target).closest("#colourfix")) return;
-    ports.setPop(null); ports.setDrawer(true); ports.setSheetTab("life");
+    ports.layers.setPop(null); ports.layers.setDrawer(true); ports.setSheetTab("life");
     var row = ports.el("f_appearance");
     if (row) row.scrollIntoView({ block: "center" });
   });
