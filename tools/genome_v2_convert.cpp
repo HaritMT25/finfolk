@@ -1,5 +1,9 @@
 #include <filesystem>
-#include <fstream>
+#include <cerrno>
+#include <cstring>
+#include <cstdlib>
+#include <unistd.h>
+#include <vector>
 #include <iostream>
 #include "core/checkpoint_io.hpp"
 #include "core/genome_v2_conversion.hpp"
@@ -22,7 +26,28 @@ int main(int argc, char** argv) {
         std::cerr << error << '\n'; return 1;
     }
     const auto text = checkpoint::serialize(world, "0.27.0");
-    std::ofstream out(output, std::ios::binary);
-    out.write(text.data(), static_cast<std::streamsize>(text.size()));
-    if (!out) { std::cerr << "could not write converted checkpoint\n"; return 1; }
+    // An exclusive sibling stays private until every byte and close succeed.
+    // link() publishes atomically and refuses even a dangling destination symlink.
+    std::string pattern = (output.parent_path() / ".genome_v2_convert.XXXXXX").string();
+    std::vector<char> temporary(pattern.begin(), pattern.end());
+    temporary.push_back('\0');
+    const int fd = ::mkstemp(temporary.data());
+    if (fd < 0) { std::cerr << "could not create converted checkpoint: " << std::strerror(errno) << '\n'; return 1; }
+    int failure = 0;
+    size_t offset = 0;
+    while (offset < text.size()) {
+        const auto written = ::write(fd, text.data() + offset, text.size() - offset);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) { failure = written < 0 ? errno : EIO; break; }
+        offset += static_cast<size_t>(written);
+    }
+    // Do not retry close: on some systems the fd has already been released.
+    if (::close(fd) != 0 && !failure) failure = errno;
+    if (!failure && ::link(temporary.data(), output.c_str()) != 0) failure = errno;
+    const int cleanup = ::unlink(temporary.data());
+    if (failure || cleanup != 0) {
+        const int why = failure ? failure : errno;
+        std::cerr << "could not publish converted checkpoint: " << std::strerror(why) << '\n';
+        return 1;
+    }
 }

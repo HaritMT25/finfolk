@@ -440,15 +440,12 @@ inline bool readOceanJson(const char* json, SimConfig& simConfig, OceanConfig& o
     const std::string wrapped = std::string("{\"config\":") + json + "}";
     jsonm::Value root;
     if (!jsonm::Parser::parse(wrapped, root, err)) { err = "config parse error: " + err; return false; }
-    const auto* config = root.find("config");
-    const bool policyInput = config && (config->find("genomeVersion") || config->find("biasGenes") ||
-                                       config->find("hiddenNeurons") || config->find("brainEvalVersion"));
-    // New policy reads commit both configs only on success. Keep the older
-    // keys' read/check order and refusal behavior when no new policy is supplied.
+    // Stage every update: later policy or Ocean checks can refuse even when
+    // the JSON contains only pre-existing keys. Publish both configs together.
     SimConfig nextSim = simConfig;
     OceanConfig nextOcean = oceanConfig;
-    SimConfig& sc = policyInput ? nextSim : simConfig;
-    OceanConfig& oc = policyInput ? nextOcean : oceanConfig;
+    SimConfig& sc = nextSim;
+    OceanConfig& oc = nextOcean;
     using T = jsonm::Value::Type;
     if (const jsonm::Value* o = root.find("config"); o && o->isObject())
         for (const auto& kv : o->obj) {
@@ -494,10 +491,8 @@ inline bool readOceanJson(const char* json, SimConfig& simConfig, OceanConfig& o
     }
     if (const jsonm::Value* o = root.find("config"))
         if (!readOceanConfig(*o, oc, &err)) return false;
-    if (policyInput) {
-        simConfig = nextSim;
-        oceanConfig = nextOcean;
-    }
+    simConfig = nextSim;
+    oceanConfig = nextOcean;
     return true;
 }
 

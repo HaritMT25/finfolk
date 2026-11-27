@@ -1,7 +1,6 @@
 #pragma once
 #include <algorithm>
 #include <bit>
-#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include "weight_log_table.hpp"
@@ -28,7 +27,7 @@ inline constexpr bool valid(std::uint16_t encoded) {
 
 // Precondition: valid(encoded). Only validated internal data uses this.
 inline std::uint32_t decodedBits(std::uint16_t encoded) {
-    assert(valid(encoded));
+    if (!valid(encoded)) __builtin_trap();
     const unsigned q = encoded & kMagnitudeMask;
     if (q == 0u) return 0u;
     const unsigned u = q - 1u;
@@ -52,8 +51,8 @@ inline bool tryDecode(std::uint16_t encoded, float& output) {
 // Double arithmetic makes the distance comparison exact for these binary32
 // candidates, including the midpoint tests.
 inline std::uint16_t quantize(double weight) {
-    assert(std::isfinite(weight));
-    assert(weight >= -512.0 && weight <= 512.0);
+    if (!std::isfinite(weight)) __builtin_trap();
+    if (!(weight >= -512.0 && weight <= 512.0)) __builtin_trap();
     if (weight == 0.0) return 0u;
 
     const bool negative = weight < 0.0;
@@ -93,7 +92,7 @@ inline std::uint16_t quantizeLegacy(std::int16_t stored) {
 inline std::uint16_t addMagnitude(
     std::uint16_t encoded, int delta
 ) {
-    assert(valid(encoded));
+    if (!valid(encoded)) __builtin_trap();
     const unsigned q = encoded & kMagnitudeMask;
     if (q == 0u) return 0u;
     const int changed = std::clamp(
