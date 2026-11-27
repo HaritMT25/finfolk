@@ -8,17 +8,20 @@
  *   in : {cmd:'stop'}                      -> finish current chunk, post the
  *                                             checkpoint back, go idle
  *   in : {cmd:'rec', every}                -> the dashboards' sampling interval
- *   in : {cmd:'set', key, value, quiet}    -> a live setting into the running
+ *   in : {cmd:'set', key, value, quiet, readback}
+ *                                          -> a live setting into the running
  *                                             world, between two chunks (the
  *                                             module's evo_set_param: its own
  *                                             whitelist and checks; the page
  *                                             checks first, as for its own)
- *   out: {type:'set', key, value, quiet, ok, config, error, notRunning}
- *                                          -> its answer: applied (config:
- *                                             the world's config as the
- *                                             engine now holds it), refused
- *                                             (error), or no world here
- *                                             (notRunning: the page keeps it)
+ *   out: {type:'set', key, value, quiet, ok, config, configError, error, notRunning}
+ *                                          -> its answer: applied (config,
+ *                                             when readback asked: the world's
+ *                                             config as the engine now holds
+ *                                             it, or configError: why it could
+ *                                             not be read), refused (error), or
+ *                                             no world here (notRunning: the
+ *                                             page keeps it)
  *   out: {type:'stats', frame, pop, food, pred, stepsPerSec, totalSteps} ~4x/s
  *   out: {type:'rec', s, b, c}             -> what the dashboard recorder saw
  *                                             (samples, births, changes; see
@@ -107,11 +110,24 @@ onmessage = function (e) {
       postMessage({ type: "set", key: key, value: value, quiet: quiet, ok: false, notRunning: true, error: "Turbo is not running" });
       return;
     }
+    /* a value no field of the engine can keep (past float32's range: it would run as infinity) is refused before it
+     * is applied, as the page refuses it (renderer.js tooBig) */
+    if (!isFinite(Math.fround(+value.toPrecision(9)))) {
+      postMessage({ type: "set", key: key, value: value, quiet: quiet, ok: false, config: null,
+                    error: key + " is too large for the engine (it keeps 32-bit numbers, at most about 3.4e38)" });
+      return;
+    }
     var ok = Module._evo_set_param ? withCString(key, function (ptr) { return Module._evo_set_param(ptr, value); }) : 0;
-    /* applied: the world's whole config as the engine now holds it (it normalizes: whole numbers cut, the speeds put
-     * in order), the page's record of what runs; its checkpoint is the module's only way to say it */
-    postMessage({ type: "set", key: key, value: value, quiet: quiet, ok: !!ok,
-                  config: ok ? JSON.parse(Module.UTF8ToString(Module._evo_checkpoint())).config : null,
+    /* applied, and asked for (readback: a value the engine's clamps move, a speed past the other or a predator floor past 2000):
+     * the world's whole config as the engine now holds it, the page's record of what runs (its checkpoint is the
+     * module's only way to say it). A world whose state overflowed writes "inf", which is not JSON: configError
+     * says why, the value is applied all the same, and the page goes by what it sent */
+    var config = null, configError = "";
+    if (ok && msg.readback) {
+      try { config = JSON.parse(Module.UTF8ToString(Module._evo_checkpoint())).config; }
+      catch (err) { configError = String(err && err.message || err); }
+    }
+    postMessage({ type: "set", key: key, value: value, quiet: quiet, ok: !!ok, config: config, configError: configError,
                   error: ok ? "" : Module._evo_set_param ? Module.UTF8ToString(Module._evo_last_error()) : "this module has no live settings" });
   }
 };

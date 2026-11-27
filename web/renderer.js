@@ -459,6 +459,13 @@
       showError((LABELS[key] || key) + " must be a whole number (the running world keeps " + shown(back) + ").");
       return;
     }
+    var big = tooBig(key, v);
+    if (big) {   /* (it would run as something else: a float past float32 as infinity, a long whole number cut or capped) */
+      var kept = liveNow(key);
+      input.value = shown(kept);
+      showError((LABELS[key] || key) + " " + big + " (the running world keeps " + shown(kept) + ").");
+      return;
+    }
     /* (the run's history changes only with a value: a stepper clamped at its bound still fires change) */
     if (key === "maxPopulation") {
       var cap = Math.max(0, Math.round(v));
@@ -477,12 +484,13 @@
   var heldLive = [];     /* [{key, value, quiet}] waiting for Turbo to start or hand back, in the order typed */
   var sentLive = [];     /* the same, sent to Turbo's worker and not yet answered, in the order sent (it answers in that order) */
   var turboAcked = [];   /* the values this Turbo session's worker applied: if its world is lost, the page's copy takes them */
+  var turboEntryCfg = null;   /* the record when Turbo took the world (enterTurbo) */
   function sendLive(key, v, quiet) {
     if (!engineOk()) return;
     var e = { key: key, value: v, quiet: !!quiet };
     if (turboState === "turbo") {
       sentLive.push(e);
-      turboWorker.postMessage({ cmd: "set", key: key, value: v, quiet: e.quiet });
+      turboWorker.postMessage({ cmd: "set", key: key, value: v, quiet: e.quiet, readback: moves(key, v) });
       return;
     }
     if (turboState !== "live") {
@@ -491,8 +499,10 @@
       return;
     }
     var ok = withCString(key, function (ptr) { return Module._evo_set_param(ptr, v); });
-    if (ok) liveApplied(key, quiet, engineConfig());
-    else liveRefused(key, Module.UTF8ToString(Module._evo_last_error()), quiet);
+    if (!ok) { liveRefused(key, Module.UTF8ToString(Module._evo_last_error()), quiet); return; }
+    var read = moves(key, v), cfg = read ? readEngineConfig() : null;
+    liveApplied(key, quiet, cfg || applyRule(runCfg, key, v));
+    if (read && !cfg) sayUnread("The engine", LABELS[key] || key);
   }
   /* a newer value of key on its way: held for Turbo's start or hand-back, or sent to its worker and not yet answered */
   function onTheWay(key) {
@@ -540,17 +550,67 @@
       sendLive(h.key, h.value, h.quiet);
     }
   }
-  /* the running world's config as the engine holds it: its checkpoint's (the module has no other way to say it;
-   * a read of the world's state, ~9 ms at 300 fish, ~90 ms at 6000), after a start, a load and an accepted live value */
+  /* The engine's own config, from its checkpoint (the module has no other
+   * way to say it: a read of the whole world, ~9 ms at 300 fish, ~100 ms at
+   * 6000), after a start and a load. A live value needs none (applyRule) but
+   * when the engine's clamps move it (moves). A world whose state
+   * overflowed (a food energy near float32's top fills a stomach past it)
+   * writes "inf", which is not JSON: then the read fails (readEngineConfig
+   * gives null), the page goes by its own record, and says so once, after
+   * what it says of the change itself (sayUnread), until a read works again. */
   function engineConfig() { return JSON.parse(Module.UTF8ToString(Module._evo_checkpoint())).config || {}; }
-  function cfgOr(c, k) { return Object.prototype.hasOwnProperty.call(c, k) ? c[k] : ADV_BY_KEY[k] ? ADV_BY_KEY[k][1] : undefined; }
+  var unread = null, unreadSaid = false;   /* the last failed read's reason */
+  function readEngineConfig() {
+    try { var c = engineConfig(); unread = null; unreadSaid = false; return c; }
+    catch (e) { unread = String(e && e.message || e); return null; }
+  }
+  function sayUnread(who, what) {
+    if (!unread || unreadSaid) return;
+    unreadSaid = true;
+    showError(who + " took " + what + ", but its state can't be read back (" + unread + "; a number in the world overflowed): the page goes by what it gave it.");
+  }
   /* What evo_set_param keeps of v for live key k (wasm/evo_wasm.cpp): it prints
    * v with %.9g and reads it back as the field's type, a float32 or a whole
-   * number (a cast). */
+   * number (a cast); then clampConfig orders the speeds and caps the predator
+   * floor (moves: such values read the engine instead). A float past
+   * float32's range would run as infinity, and a whole number of ten digits
+   * or more would be cut by the print (or capped by the cast): both refused
+   * first (tooBig). tests/classic_safety_tests.cjs holds this to the engine. */
+  /* the value v for key is one the engine's clamps move (clampConfig: Slowest speed above Fastest, or Fastest below
+   * Slowest, swapped; a predator floor past 2000, capped): the page reads the engine's config after it (a read of the
+   * whole world: rare) rather than go by the rule */
+  function moves(key, v) {
+    var x = engineVal(key, v);
+    if (key === "minSpeed") return x > cfgOr(runCfg, "maxSpeed");
+    if (key === "maxSpeed") return x < cfgOr(runCfg, "minSpeed");
+    if (key === "predatorMinPopulation") return x > 2000 || x < 0;
+    return false;
+  }
+  var MAX_WHOLE = 999999999;
   function engineVal(k, v) {
     var x = +(+v).toPrecision(9);
     if (INT_KEYS[k]) return Math.max(-2147483648, Math.min(2147483647, Math.trunc(x)));
     return Math.fround(x);
+  }
+  function tooBig(k, v) {
+    if (INT_KEYS[k]) return Math.abs(v) > MAX_WHOLE ? "is too large for the engine (it keeps whole numbers of up to nine digits)" : "";
+    return Number.isFinite(engineVal(k, v)) ? "" : "is too large for the engine (it keeps 32-bit numbers, at most about 3.4e38)";
+  }
+  /* the record after the engine took v for key: the record with it, as the engine keeps it (and, as a fallback when a
+   * read after a value the clamps move fails, clampConfig's two rules mirrored) */
+  function applyRule(cfg, key, v) {
+    var c = Object.assign({}, cfg);
+    c[key] = engineVal(key, v);
+    if (cfgOr(c, "minSpeed") > cfgOr(c, "maxSpeed")) { var lo = cfgOr(c, "maxSpeed"); c.maxSpeed = cfgOr(c, "minSpeed"); c.minSpeed = lo; }
+    if (key === "predatorMinPopulation") c[key] = Math.max(0, Math.min(2000, c[key]));
+    return c;
+  }
+  function cfgOr(c, k) { return Object.prototype.hasOwnProperty.call(c, k) ? c[k] : ADV_BY_KEY[k] ? ADV_BY_KEY[k][1] : undefined; }
+  /* a config as the engine keeps its live keys (a fallback record when its own can't be read) */
+  function asEngineKeeps(cfg) {
+    var c = Object.assign({}, cfg);
+    Object.keys(LIVE).forEach(function (k) { if (typeof c[k] === "number" && Number.isFinite(c[k])) c[k] = engineVal(k, c[k]); });
+    return c;
   }
   /* Two values of live key k are the same run when the engine keeps them as
    * the same number: decisions (the run's history, the live tweaks the
@@ -934,9 +994,10 @@
     resetGovernor();
     if (!ok) showError("evo_init failed: " + Module.UTF8ToString(Module._evo_last_error()));
     else {
-      runCfg = engineConfig(); governed = false; liveEdited = false; loadedRun = false; updateModeline(); if (dash()) dash().reset();   /* a new run: new charts */
+      runCfg = readEngineConfig() || asEngineKeeps(cfg); governed = false; liveEdited = false; loadedRun = false; updateModeline(); if (dash()) dash().reset();   /* a new run: new charts */
       startCfg = Object.assign({}, runCfg); startCap = userCap; usedTurbo = false;   /* (what the replace rule compares with) */
       brainClock.reset(worldTick(), true);   /* (tick 0: no fish has run its brain yet) */
+      sayUnread("The engine", "the new world's settings");
     }
     return !!ok;
   }
@@ -1706,7 +1767,11 @@
       showError("Couldn't load that checkpoint: " + Module.UTF8ToString(Module._evo_last_error()));
       return false;
     }
-    runCfg = engineConfig();   /* (what the engine took from the file: a floor of 0.5 runs as 0; Turbo's: the worker's world's) */
+    /* (what the engine took from the file: a floor of 0.5 runs as 0; Turbo's: the worker's world's. Unreadable: the file's
+     * settings as the engine keeps them, or Turbo's answers) */
+    var fileCfg = null;
+    if (!fromTurbo) { try { fileCfg = JSON.parse(text).config || {}; } catch (e) { fileCfg = {}; } }
+    runCfg = readEngineConfig() || (fromTurbo ? runCfg : asEngineKeeps(fileCfg));
     if (!fromTurbo) {
       governed = false; liveEdited = false; loadedRun = true;   /* (updateModeline: the caller's, after the governor's reset) */
       startCfg = Object.assign({}, runCfg); usedTurbo = false;   /* (startCap: the caller's, with the file's cap) */
@@ -1726,7 +1791,7 @@
     worldFitted = false;
     updateFitButton();
     el("randnote").textContent = "";  /* the Randomize pick no longer describes this world */
-    if (!fromTurbo) showNote("Checkpoint loaded.");
+    if (!fromTurbo) { showNote("Checkpoint loaded."); sayUnread("The engine", "the saved world"); }
     return true;
   }
 
@@ -1775,9 +1840,10 @@
       answered(msg.key);
       if (msg.ok) {
         turboAcked.push({ key: msg.key, value: msg.value });
-        var cfg = msg.config;   /* (the worker's engine's own config, read after it applied the value) */
-        if (!cfg) { cfg = Object.assign({}, runCfg); cfg[msg.key] = msg.value; }
-        liveApplied(msg.key, msg.quiet, cfg);
+        /* (a value the clamps move: the worker's engine's own config, read after it applied the value; else, or when that read
+         * failed, the value as the engine keeps it) */
+        liveApplied(msg.key, msg.quiet, msg.config || applyRule(runCfg, msg.key, msg.value));
+        if (msg.configError) { unread = msg.configError; sayUnread("Turbo's engine", LABELS[msg.key] || msg.key); }
       }
       else if (msg.notRunning) { if (turboState === "turbo") heldLive.push({ key: msg.key, value: msg.value, quiet: msg.quiet }); else sendLive(msg.key, msg.value, msg.quiet); }
       else liveRefused(msg.key, msg.error || "Turbo refused " + msg.key, msg.quiet);
@@ -1791,8 +1857,8 @@
       var back = loadCheckpointText(msg.json, true);
       setPaused(false);             /* turbo implies running; come back un-paused */
       updateLocks();
-      if (back) { showNote("Turbo ran " + (turboStats ? turboStats.totalSteps.toLocaleString() : 0) + " steps."); turboAcked = []; }
-      recoverLive();                /* (every answer came before the checkpoint: nothing is unanswered; refused, the page's copy takes them) */
+      if (back) { showNote("Turbo ran " + (turboStats ? turboStats.totalSteps.toLocaleString() : 0) + " steps."); sayUnread("The engine", "Turbo's world"); turboAcked = []; }
+      recoverLive(!back);           /* (every answer came before the checkpoint: nothing is unanswered; refused, the page's copy takes them) */
       flushHeld();                  /* values typed while it handed back: into the world it handed back */
     } else if (msg.type === "error") {
       showError("Turbo stopped: " + (msg.message || "unknown error"));
@@ -1806,16 +1872,19 @@
     turboState = "live";
     dropWorker();
     updateLocks();
-    recoverLive();
+    recoverLive(true);
     flushHeld();
   }
   function dropWorker() {
     if (turboWorker) { turboWorker.onmessage = turboWorker.onerror = null; turboWorker.terminate(); turboWorker = null; }
   }
-  /* the world Turbo had is lost: this page's copy takes the live values the worker applied (the run's record has them:
-   * quietly), and the ones it never answered go first in line for it (held: applied here and said, or refused and
-   * their field put back), before the ones typed while Turbo started or handed back */
-  function recoverLive() {
+  /* lost: the world Turbo had is lost, and this page's copy, as Turbo took it, runs on. The record goes back to that
+   * world's (it followed the worker's), then the copy takes the live values the worker applied (quietly: they were
+   * said), and the ones it never answered go first in line for it (held: applied here and said, or refused and their
+   * field put back), before the ones typed while Turbo started or handed back. Each is kept by the rule against the
+   * world it now goes to (a speed swap is the page's copy's). Not lost: every answer came before the checkpoint */
+  function recoverLive(lost) {
+    if (lost && turboEntryCfg) runCfg = turboEntryCfg;
     turboAcked.splice(0).forEach(function (a) { sendLive(a.key, a.value, true); });
     heldLive = sentLive.splice(0).concat(heldLive);
   }
@@ -1829,6 +1898,7 @@
     turboState = "entering";
     turboStats = null;
     turboAcked = []; sentLive = [];
+    turboEntryCfg = runCfg;   /* (the record of this page's copy as Turbo takes it: what a lost Turbo goes back to) */
     selectedId = null; /* ids will be stale by exit */
     updateLocks();
     if (!turboWorker) { /* created once, reused across sessions */
