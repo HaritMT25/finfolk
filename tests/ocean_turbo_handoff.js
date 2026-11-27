@@ -5709,6 +5709,9 @@ async function pageSetupStateUX() {
         await until(() => sh.delivered.filter(isType('set')).length === sh.toWorker.filter(m => m.cmd === 'set').length, 'the edit\'s answer');
         ok(!before && !!t.T.draft && t.T.runCfg.foodSpawnBase === 6 && !!ringT('food') && !t.uncaught.length,
            'Turbo: the Food ring appears when the worker\'s answer makes the running Food 6 while Standard is staged');
+        t.click('randombig');   /* Surprise me staged while Turbo runs: its card says what its Start does, as every card does */
+        ok(t.el('scenario-start').querySelector('span').textContent === 'Stop & start' && t.el('restart').querySelector('span').textContent === 'Stop Turbo & start',
+           'Turbo: the Surprise card and the bar both say the start stops Turbo first (review of #107, P3)');
     }
 }
 

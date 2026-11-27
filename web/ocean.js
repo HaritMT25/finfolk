@@ -1360,7 +1360,7 @@
     acts.hidden = !pickedId;
     el("rerollbtn").hidden = pickedId !== "surprise";
     var lab = el("scenario-start").querySelector("span");
-    if (lab) lab.textContent = pickedId === "surprise" ? "Start this draw" : turboState !== "live" ? "Stop & start" : "Start";
+    if (lab) lab.textContent = turboState !== "live" ? "Stop & start" : pickedId === "surprise" ? "Start this draw" : "Start";
     el("scenario-start").title = turboState !== "live" ? "Stops Turbo, then starts this world (asked first)" : "Starts this world";
     /* a phone's strip scrolls sideways: the picked card comes into view with
      * its Start, at a place the strip snaps to (its start), so it stays there */
