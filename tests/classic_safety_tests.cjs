@@ -32,6 +32,12 @@
 //      every setting withdraws an open question; no key acts behind the failure screen; a refused Restart keeps what waits;
 //      Fit asks and 299.98 simulated seconds do not; a file read a newer pick or a new world overtook is dropped; each
 //      fallback step's failure is logged and the fish-shapes switch follows WebGL's
+//   8. the fourth review of PR #104 (Codex; 8a and 8b fail on 0c99c69, 8c on 56418d1): decisions on what was submitted, so a
+//      %.9g decimal tie the page's rounding breaks the other way (100000004.5) is a change (history, the question); the
+//      record read once at the first edit after a load (a loaded floor of 2001, clamped to 2000 by an unrelated edit's
+//      setter: a refusal says 2000), later ordinary edits reading nothing; a trap in evo_checkpoint itself during a read the
+//      clamps asked for stops the engine here and kills the worker there, the page taking its world back; the worker's own
+//      whole-number checks (section 1)
 // The page runs on tests/ui_inspector_tests.cjs's small DOM and window (its ids from web/index.html).
 "use strict";
 const fs = require("fs");
@@ -69,7 +75,8 @@ function makeWorker(onPost) {
       this.port2 = { postMessage: (d) => setImmediate(() => { if (p1.onmessage) p1.onmessage({ data: d }); }) };
     }
   }
-  const ctx = { console, performance, MessageChannel: Chan, setTimeout, clearTimeout, onmessage: null };
+  /* (WebAssembly: the host's, as the module the worker runs is the host's: its traps are that realm's RuntimeError) */
+  const ctx = { console, performance, MessageChannel: Chan, setTimeout, clearTimeout, WebAssembly, onmessage: null };
   ctx.importScripts = () => {};
   ctx.createEvoBoids = () => mkClassic();
   ctx.postMessage = (m) => onPost(m);
@@ -86,7 +93,15 @@ class FakeWorker {
     this.w = makeWorker((m) => setImmediate(() => { if (!this.dead && this.onmessage) this.onmessage({ data: m }); }));
     workers.push(this);
   }
-  postMessage(m) { if (m && m.cmd === "set") this.sets = (this.sets || 0) + 1; const c = structuredClone(m); setImmediate(() => { if (!this.dead) this.w.send(c); }); }
+  postMessage(m) {
+    if (m && m.cmd === "set") this.sets = (this.sets || 0) + 1;
+    const c = structuredClone(m);
+    setImmediate(() => {   /* (an exception in the worker's handler is its error event, as a browser's: the page's onerror) */
+      if (this.dead) return;
+      try { this.w.send(c); }
+      catch (e) { if (this.onerror) this.onerror({ message: "Uncaught " + (e && e.message || e), preventDefault() {} }); }
+    });
+  }
   terminate() { this.dead = true; if (this.w.ctx.running !== undefined) vm.runInContext("running = false;", this.w.ctx); }
 }
 
@@ -111,14 +126,19 @@ async function workerSet() {
   W.send({ cmd: "set", key: "maxPopulation", value: 400, quiet: true });
   W.send({ cmd: "set", key: "minSpeed", value: 200, readback: true });
   W.send({ cmd: "set", key: "metabolicRate", value: 1e39 });
+  W.send({ cmd: "set", key: "targetFood", value: 0.5 });
+  W.send({ cmd: "set", key: "minPopulation", value: 1e12 });
   const sets = got.slice(n0).filter((m) => m.type === "set");
-  ok(sets.length === 6 && sets[0].ok === true && sets[0].value === 900 && sets[0].quiet === false && !sets[0].notRunning,
+  ok(sets.length === 8 && sets[0].ok === true && sets[0].value === 900 && sets[0].quiet === false && !sets[0].notRunning,
      "Turbo running: targetFood 900 applied between chunks, answered ok", sets[0]);
   ok(sets[0].config === null && sets[4].ok === true && sets[4].config && sets[4].config.minSpeed === 150 && sets[4].config.maxSpeed === 200 && !sets[4].configError,
      "  asked to read back (minSpeed 200, a key the engine's clamps move): its answer carries the world's config as the engine holds it " +
      "(the speeds swapped: 150 / 200); a plain value's answer reads nothing (config null)", [sets[0].config, sets[4].config && [sets[4].config.minSpeed, sets[4].config.maxSpeed]]);
   ok(sets[5].ok === false && /metabolicRate is too large for the engine/.test(sets[5].error),
      "  metabolicRate 1e39 (finite, but past float32: it would run as infinity and break every checkpoint): refused before it is applied", sets[5]);
+  ok(sets[6].ok === false && sets[6].error === "targetFood must be a whole number" &&
+     sets[7].ok === false && sets[7].error === "minPopulation is too large for the engine (it keeps whole numbers of up to nine digits)",
+     "  the page's whole-number checks, made by the worker too: targetFood 0.5 and minPopulation 1e12 refused there", [sets[6].error, sets[7].error]);
   ok(sets[1].ok === false && /not a live parameter/.test(sets[1].error) && !sets[1].notRunning,
      "  foodPatches (not live): the engine refuses it, with its reason", sets[1]);
   ok(sets[2].ok === false && /finite and >= 0/.test(sets[2].error), "  foodEnergy -1: the engine refuses it", sets[2]);
@@ -126,7 +146,7 @@ async function workerSet() {
   W.send({ cmd: "stop" });
   await until(() => got.some((m) => m.type === "checkpoint"), "the hand-back's checkpoint");
   const cp = JSON.parse(last("checkpoint").json);
-  ok(cp.config.targetFood === 900 && cp.config.maxPopulation === 400 && cp.config.foodEnergy === 5 && cp.config.metabolicRate === 1.5 && cp.world.frame > 0,
+  ok(cp.config.targetFood === 900 && cp.config.maxPopulation === 400 && cp.config.foodEnergy === 5 && cp.config.metabolicRate === 1.5 && cp.config.minPopulation === 50 && cp.world.frame > 0,
      "the hand-back's checkpoint carries the applied values (targetFood 900, maxPopulation 400; foodEnergy still 5) at frame " + cp.world.frame,
      [cp.config.targetFood, cp.config.maxPopulation, cp.config.foodEnergy]);
   W.send({ cmd: "set", key: "targetFood", value: 700 });
@@ -841,6 +861,90 @@ async function reviewP3() {
   }
 }
 
+/* ================================================ 8. the fourth review of PR #104 (Codex, 56418d1) ================================================ */
+/* decisions on what was submitted: a %.9g tie the page's own rounding breaks the other way is still a change */
+async function reviewTie() {
+  section("8a. a decimal tie (100000004.5): the engine keeps 100000000, a mirror said 100000008; the change is a change");
+  const G = await startedPage({ dash: true }), { el, box } = G, M = box.M;
+  ok((100000004.5).toPrecision(9) === "100000005" && Math.fround(100000005) === 100000008,
+     "the tie: JavaScript's toPrecision(9) rounds 100000004.5 up (100000005, float32 100000008), C's %.9g to even (100000004, float32 100000000)");
+  G.setField("adv_maxAge", 100000008);
+  el("restart").click(); G.settle();
+  if (G.asked()) el("startconfirm").click();
+  G.settle();
+  ok(!G.asked() && configOf(M).maxAge === 100000008 && !/live/.test(el("modeline").dataset.why || ""), "a fresh world started with Lifespan 100000008 (no history yet)");
+  G.setField("adv_maxAge", 100000004.5);
+  ok(configOf(M).maxAge === 100000000 && /live/.test(el("modeline").dataset.why || ""),
+     "Lifespan 100000004.5: the engine keeps 100000000, and the run's history has the change (it no longer replays)", [configOf(M).maxAge, el("modeline").dataset.why]);
+  G.P.key("r"); G.settle();
+  ok(G.asked() && /Your live tweak \(Lifespan \(s\) 100000000\) carries over to the new world\./.test(el("startaskmsg").textContent),
+     "  R asks (a live tweak), naming the value the engine runs", el("startaskmsg").textContent);
+  G.P.key("Escape");
+  G.setField("adv_maxAge", 100000008);
+  G.P.key("r"); G.settle();
+  ok(!G.asked(), "  set back to the very value it started with (100000008): no live tweak, R starts at once");
+}
+
+/* the record is the engine's: read once at the first edit after a load (the setter clamps the whole config), so a revert says what runs */
+async function reviewCanonical() {
+  section("8b. a loaded floor of 2001, an unrelated edit (the setter clamps it to 2000), then a refused floor: the field and the words say 2000");
+  const G = await startedPage({ dash: true }), { el, box } = G, M = box.M;
+  const cp = JSON.parse(M.UTF8ToString(M._evo_checkpoint()));
+  cp.config.predatorMinPopulation = 2001;
+  await G.load("floor2001.json", JSON.stringify(cp));
+  ok(/Checkpoint loaded/.test(G.said()) && configOf(M).predatorMinPopulation === 2001, "the file loads: the engine runs a predator floor of 2001 (a load clamps nothing)");
+  let reads = 0;
+  const cp0 = M._evo_checkpoint;
+  M._evo_checkpoint = function () { reads++; return cp0.apply(this, arguments); };
+  G.setField("adv_foodEnergy", 6);
+  const r1 = reads;
+  ok(configOf(M).predatorMinPopulation === 2000 && box.host.runConfig().predatorMinPopulation === 2000 && r1 === 1,
+     "Energy per food 6 (unrelated): the setter clamps the floor to 2000; this first edit after the load reads the engine once, and the record says 2000", [r1, box.host.runConfig().predatorMinPopulation]);
+  reads = 0;
+  G.setField("adv_predatorMinPopulation", -1);
+  ok(el("adv_predatorMinPopulation").value === "2000" && G.said() === "predatorMinPopulation must be finite and >= 0 (the running world keeps 2000).",
+     "  a floor of -1 refused: the field back to 2000 and the error says 2000, the floor that runs (not the file's 2001)", [el("adv_predatorMinPopulation").value, G.said()]);
+  G.setField("adv_targetFood", 700);
+  G.setField("adv_targetFood", 701);
+  const rr = reads;
+  ok(rr === 0 && configOf(M).targetFood === 701, "  later ordinary edits read nothing (a refusal, Food target 700, then 701): " + rr + " reads", rr);
+}
+
+/* a trap in the engine's checkpoint during a read the clamps asked for: the engine stops, the operation ends, nothing escapes */
+async function reviewReadbackTrap() {
+  section("8c. a trap in evo_checkpoint itself, during a read the engine's clamps asked for: here and in the worker");
+  {
+    const e0 = escaped.length;
+    const G = await startedPage(), { D, el, box } = G, M = box.M;
+    G.setField("adv_targetFood", 700);   /* (the first edit after the start: its read is done) */
+    M._evo_checkpoint = () => { throw trapErr("evo_checkpoint"); };
+    G.setField("adv_minSpeed", 200);   /* (above Fastest: the engine swaps them, the page reads its config) */
+    ok(el("splash").classList.contains("failed") && /^The engine stopped \(injected trap in evo_checkpoint\)/.test(G.said()) && !/is now/.test(G.said()) &&
+       D.errors.length === 0 && escaped.length === e0,
+       "here: the read traps; the engine stops (its screen), the edit's operation ends there (no note it applied), nothing escapes", [G.said(), D.errors.slice(0, 1), escaped.slice(e0)]);
+  }
+  {
+    const e0 = escaped.length;
+    const G = await startedPage({ dash: true }), { D, el, box } = G, M = box.M;
+    el("turbobtn").click();
+    await until(() => G.state() === "turbo", "Turbo running");
+    G.setField("adv_targetFood", 700);
+    await until(() => G.said() === "Food target is now 700 (live)", "the worker's first answer (its read)");
+    const w = workers[workers.length - 1];
+    w.w.ctx.Module._evo_checkpoint = () => { throw trapErr("the worker's evo_checkpoint"); };
+    G.setField("adv_minSpeed", 200);
+    await until(() => G.state() === "live", "the worker's failure");
+    await new Promise((r) => setTimeout(r, 20));
+    const c = configOf(M), r = box.host.runConfig();
+    ok(/The Turbo worker failed: .*injected trap in the worker's evo_checkpoint/.test(D.doc.getElementById("toasts").textContent + " " + G.said()) || w.dead,
+       "in the worker: its read traps, the worker dies (it reported nothing as applied), and the page takes the world back", [G.said()]);
+    ok(!el("splash").classList.contains("failed") && c.minSpeed === 150 && c.maxSpeed === 200 && Math.fround(r.minSpeed) === 150 && Math.fround(r.maxSpeed) === 200 &&
+       c.targetFood === 700 && D.errors.length === 0 && escaped.length === e0,
+       "  the page's own engine runs on: it takes Food target 700 (answered) and Slowest speed 200 (unanswered: swapped, 150 / 200), the record agrees, nothing escapes",
+       [c.minSpeed, c.maxSpeed, r.minSpeed, r.maxSpeed, c.targetFood, D.errors.slice(0, 1), escaped.slice(e0)]);
+  }
+}
+
 (async () => {
   /* each section on its own: one section's throw never hides the next (sections 3 and 4b go on section 2's page) */
   const run = async (name, f) => { try { return await f(); } catch (e) { ok(false, name + " threw: " + (e && e.stack || e)); return null; } };
@@ -849,7 +953,8 @@ async function reviewP3() {
   if (G) { await run("turboEdits", () => turboEdits(G)); await run("engineTrap", () => engineTrap(G)); }
   await run("startFailures", startFailures);
   for (const t of [reviewLoadBypass, reviewStoppedFence, reviewUnanswered, reviewHeldOrder, reviewFrameErrors, reviewRecord,
-                   reviewRounding, reviewRecordRule, reviewOverflow, reviewTrapsOutsideFrame, reviewResetWithdraws, reviewP3]) await run(t.name, t);
+                   reviewRounding, reviewRecordRule, reviewOverflow, reviewTrapsOutsideFrame, reviewResetWithdraws, reviewP3,
+                   reviewTie, reviewCanonical, reviewReadbackTrap]) await run(t.name, t);
   ok(escaped.length === 0, "nothing escaped to node in the whole run (no unhandled rejection, no uncaught exception)", escaped.slice(0, 3));
   for (const w of workers) w.terminate();
   console.log((fails ? "FAILED " + fails + " of " : "all ") + checks + " checks" + (fails ? "" : " passed"));
