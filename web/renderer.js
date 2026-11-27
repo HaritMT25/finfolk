@@ -715,10 +715,17 @@
    * it, at any depth, ends it and stops the engine (engineStopped), as the
    * frame's does, never escaping with the engine unfenced (the Ocean's
    * fenced). Any other error goes on as it was. */
+  var fenceDepth = 0;   /* how deep the fences are now (the frame, an entry, an entry inside it: the dashboards' hooks) */
   function fenced(fn) {
     return function () {
+      fenceDepth++;
       try { return fn.apply(this, arguments); }
-      catch (err) { if (isTrap(err)) { engineStopped(err); return undefined; } throw err; }
+      catch (err) {
+        if (!isTrap(err)) throw err;
+        engineStopped(err);
+        if (fenceDepth > 1) throw err;   /* (a fence inside another: the trap goes on to the outermost, which ends the whole operation) */
+        return undefined;
+      } finally { fenceDepth--; }
     };
   }
   /* The module as the dashboards get it (web/dashboard.js reads it from its
@@ -733,7 +740,12 @@
       if (!wrapped[k]) wrapped[k] = function () {
         if (!engineOk()) return 0;
         try { return m[k].apply(m, arguments); }
-        catch (err) { if (isTrap(err)) { engineStopped(err); return 0; } throw err; }
+        catch (err) {
+          if (!isTrap(err)) throw err;
+          engineStopped(err);
+          if (fenceDepth > 0) throw err;   /* (inside an operation: it ends there, nothing after it reaches the module) */
+          return 0;                        /* (the dashboards' own timer or control: an empty answer, as they close) */
+        }
       };
       return wrapped[k];
     } });
@@ -1038,11 +1050,11 @@
     if (!engineOk() || guardTurbo()) return "refused";
     return replaceRun("restart", restart, {});
   }
-  /* R: a new seed, the rest as the sheet says */
+  /* R: a new seed, the rest as the sheet says (a start the engine refuses keeps the seed the sheet had) */
   function requestNewSeed() {
     if (!engineOk() || guardTurbo()) return "refused";
     var seed = (Math.random() * 0x100000000) >>> 0;
-    return replaceRun("restart", function () { el("seed").value = String(seed); restart(); }, {});
+    return replaceRun("restart", function () { var was = el("seed").value; el("seed").value = String(seed); if (!restart()) el("seed").value = was; }, {});
   }
 
   /* ---- Randomize: a whole setup drawn from tested ranges ----
@@ -1647,16 +1659,18 @@
    * 2D) and the next frame tries again; with no step left, the frame is tried
    * once a second until it works again, and then says so. */
   var frameFault = null;   /* {at, retrying}: the frame threw (not the engine) */
+  var drawFailed = false;  /* the world was never drawn: its failure screen shows, no frame runs */
   function frame(now) {
     requestAnimationFrame(frame);
-    if (!engineOk()) return;   /* (stopped: nothing more is stepped or read) */
+    if (!engineOk() || drawFailed) return;   /* (stopped: nothing more is stepped or read) */
     if (frameFault && now - frameFault.at < 1000) return;
+    fenceDepth++;   /* (the frame is a fence too: a trap inside it, the dashboards' pump's included, ends the frame) */
     try { frameBody(now); }
     catch (err) {
-      if (err instanceof WebAssembly.RuntimeError) { engineStopped(err); return; }
+      if (isTrap(err)) { engineStopped(err); return; }
       frameFailed(err, now);
       return;
-    }
+    } finally { fenceDepth--; }
     if (frameFault) {
       var retried = frameFault.retrying;
       frameFault = null;
@@ -1668,7 +1682,7 @@
     if (!prev || !prev.retrying) console.error("evo_boids: a frame failed (" + why + ")", err);   /* (once a step: each fallback's own) */
     if (view3d) {   /* the next frame, in the flat view */
       frameFault = { at: -Infinity, retrying: false };
-      try { setView(false); } catch (e) { view3d = false; document.body.classList.remove("view-3d"); }
+      try { setView(false); } catch (e) { if (isTrap(e)) throw e; view3d = false; document.body.classList.remove("view-3d"); }
       showError("The tank view failed (" + why + "), so this is the flat view now.");
     } else if (glScene) {   /* the next frame, in canvas 2D (circles: no fish shapes) */
       frameFault = { at: -Infinity, retrying: false };
@@ -1680,6 +1694,9 @@
       hint.textContent = "WebGL drawing failed, so this page draws with canvas 2D now, which keeps the circles";
       updateModeline();
       showError("WebGL drawing failed (" + why + "), so the world is drawn with canvas 2D now.");
+    } else if (!splashDone) {   /* never drawn, no step left: the failure screen (the splash would wait forever) */
+      drawFailed = true;
+      failScreen("The world couldn't be drawn (" + why + ").\nReload the page to try again.", true);
     } else {   /* no step left: once a second, said once */
       frameFault = { at: now, retrying: true };
       if (!prev || !prev.retrying) showError("Drawing the world failed (" + why + "); the page tries again once a second.");
@@ -2024,24 +2041,33 @@
     turboEntryStale = recordStale;
     selectedId = null; /* ids will be stale by exit */
     updateLocks();
-    if (!turboWorker) { /* created once, reused across sessions */
-      turboWorker = new Worker(ASSETS.worker);
-      turboWorker.onmessage = fenced(onTurboMessage);
-      turboWorker.onerror = fenced(function (ev) {
-        if (ev && ev.preventDefault) ev.preventDefault();   /* (said here: not also as the worker's uncaught error) */
-        showError("The Turbo worker failed: " + (ev.message || "could not load worker.js"));
-        turboLost();
-      });
+    /* A start that throws here (the Worker refused: a file:// page, a CSP's worker-src; its first message) goes back to
+     * live as a worker that fails while starting does: the worker dropped, the held edits applied, said (the Ocean's);
+     * a trap goes on to the fence, which stops the engine */
+    try {
+      if (!turboWorker) { /* created once, reused across sessions */
+        turboWorker = new Worker(ASSETS.worker);
+        turboWorker.onmessage = fenced(onTurboMessage);
+        turboWorker.onerror = fenced(function (ev) {
+          if (ev && ev.preventDefault) ev.preventDefault();   /* (said here: not also as the worker's uncaught error) */
+          showError("The Turbo worker failed: " + (ev.message || "could not load worker.js"));
+          turboLost();
+        });
+      }
+      /* everything recorded up to the hand-off goes to the dashboards first;
+       * the worker records on from here at the same interval */
+      if (Module._evo_rec_flush) { Module._evo_rec_flush(); if (dash()) dash().pump(); }
+      turboWorker.postMessage({ cmd: "start",
+                                checkpoint: Module.UTF8ToString(Module._evo_checkpoint()),
+                                js: moduleUrls.js, wasm: moduleUrls.wasm,
+                                threads: Module._evo_threads ? Module._evo_threads() : 1,
+                                recEvery: dash() ? dash().every() : 60,
+                                culled: Module._evo_rec_culled ? Module._evo_rec_culled() : 0 });
+    } catch (err) {
+      if (isTrap(err)) throw err;
+      showError("Turbo couldn't start (" + (err && err.message || err) + "): your run carries on here.");
+      turboLost();
     }
-    /* everything recorded up to the hand-off goes to the dashboards first;
-     * the worker records on from here at the same interval */
-    if (Module._evo_rec_flush) { Module._evo_rec_flush(); if (dash()) dash().pump(); }
-    turboWorker.postMessage({ cmd: "start",
-                              checkpoint: Module.UTF8ToString(Module._evo_checkpoint()),
-                              js: moduleUrls.js, wasm: moduleUrls.wasm,
-                              threads: Module._evo_threads ? Module._evo_threads() : 1,
-                              recEvery: dash() ? dash().every() : 60,
-                              culled: Module._evo_rec_culled ? Module._evo_rec_culled() : 0 });
   }
   function exitTurbo() {
     if (turboState !== "turbo") return;
