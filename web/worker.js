@@ -13,8 +13,10 @@
  *                                             module's evo_set_param: its own
  *                                             whitelist and checks; the page
  *                                             checks first, as for its own)
- *   out: {type:'set', key, value, quiet, ok, error, notRunning}
- *                                          -> its answer: applied, refused
+ *   out: {type:'set', key, value, quiet, ok, config, error, notRunning}
+ *                                          -> its answer: applied (config:
+ *                                             the world's config as the
+ *                                             engine now holds it), refused
  *                                             (error), or no world here
  *                                             (notRunning: the page keeps it)
  *   out: {type:'stats', frame, pop, food, pred, stepsPerSec, totalSteps} ~4x/s
@@ -106,7 +108,10 @@ onmessage = function (e) {
       return;
     }
     var ok = Module._evo_set_param ? withCString(key, function (ptr) { return Module._evo_set_param(ptr, value); }) : 0;
+    /* applied: the world's whole config as the engine now holds it (it normalizes: whole numbers cut, the speeds put
+     * in order), the page's record of what runs; its checkpoint is the module's only way to say it */
     postMessage({ type: "set", key: key, value: value, quiet: quiet, ok: !!ok,
+                  config: ok ? JSON.parse(Module.UTF8ToString(Module._evo_checkpoint())).config : null,
                   error: ok ? "" : Module._evo_set_param ? Module.UTF8ToString(Module._evo_last_error()) : "this module has no live settings" });
   }
 };

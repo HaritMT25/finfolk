@@ -450,13 +450,13 @@
    * While Turbo owns the world the value goes to its worker (sendLive), after
    * the same checks, and is confirmed when the worker has applied it. */
   function applyLive(key, def, input) {
-    if (!Module || engineDown) return;
+    if (!engineOk()) return;
     var v = parseFloat(input.value);
     if (!Number.isFinite(v)) v = def;
     if (INT_KEYS[key] && !Number.isInteger(v)) {   /* (the engine would run it truncated: refused, the field back to what runs) */
-      var back = key === "maxPopulation" ? userCap : (key in runCfg ? runCfg[key] : def);
-      input.value = String(back);
-      showError((LABELS[key] || key) + " must be a whole number (the running world keeps " + back + ").");
+      var back = liveNow(key);
+      input.value = shown(back);
+      showError((LABELS[key] || key) + " must be a whole number (the running world keeps " + shown(back) + ").");
       return;
     }
     /* (the run's history changes only with a value: a stepper clamped at its bound still fires change) */
@@ -475,49 +475,84 @@
    * a value typed then was dropped before, while its field showed it). quiet:
    * no note (the governor's cap, a value put back after Turbo failed). */
   var heldLive = [];     /* [{key, value, quiet}] waiting for Turbo to start or hand back, in the order typed */
+  var sentLive = [];     /* the same, sent to Turbo's worker and not yet answered, in the order sent (it answers in that order) */
   var turboAcked = [];   /* the values this Turbo session's worker applied: if its world is lost, the page's copy takes them */
-  var inFlight = {};     /* key -> values sent to the worker and not yet answered */
   function sendLive(key, v, quiet) {
+    if (!engineOk()) return;
+    var e = { key: key, value: v, quiet: !!quiet };
     if (turboState === "turbo") {
-      inFlight[key] = (inFlight[key] || 0) + 1;
-      turboWorker.postMessage({ cmd: "set", key: key, value: v, quiet: !!quiet });
+      sentLive.push(e);
+      turboWorker.postMessage({ cmd: "set", key: key, value: v, quiet: e.quiet });
       return;
     }
     if (turboState !== "live") {
-      heldLive.push({ key: key, value: v, quiet: !!quiet });
-      if (!quiet) showNote((LABELS[key] || key) + " " + v + (turboState === "entering" ? " applies as soon as Turbo has started." : " applies as soon as Turbo hands the world back."));
+      heldLive.push(e);
+      if (!quiet) showNote((LABELS[key] || key) + " " + shown(v) + (turboState === "entering" ? " applies as soon as Turbo has started." : " applies as soon as Turbo hands the world back."));
       return;
     }
     var ok = withCString(key, function (ptr) { return Module._evo_set_param(ptr, v); });
-    if (ok) liveApplied(key, v, quiet);
+    if (ok) liveApplied(key, quiet, engineConfig());
     else liveRefused(key, Module.UTF8ToString(Module._evo_last_error()), quiet);
   }
-  /* The world refused v for key (the engine's reason): the field goes back to
-   * the value that runs, and the error says so, as the whole-number check does
-   * (applyLive). Not while a newer value of the key is still on its way (sent
-   * to Turbo's worker, or held for it): the field shows that one. The cap
-   * (maxPopulation, through the governor) keeps its field: only the error. */
+  /* a newer value of key on its way: held for Turbo's start or hand-back, or sent to its worker and not yet answered */
+  function onTheWay(key) {
+    var k = function (e) { return e.key === key; };
+    return heldLive.some(k) || sentLive.some(k);
+  }
+  /* The world refused a value for key (the engine's reason): the field goes
+   * back to the value that runs, and the error says so, as the whole-number
+   * check does (applyLive). Not while a newer value of the key is still on its
+   * way: the field shows that one. The cap (maxPopulation, through the
+   * governor) keeps its field: only the error. */
   function liveRefused(key, why, quiet) {
     if (quiet) return;
-    if (key === "maxPopulation" || inFlight[key] > 0 || heldLive.some(function (h) { return h.key === key; })) { showError(why); return; }
-    var back = key in runCfg ? runCfg[key] : ADV_BY_KEY[key][1], input = el("adv_" + key);
-    if (input) input.value = String(back);
-    showError(why + " (the running world keeps " + back + ").");
+    if (key === "maxPopulation" || onTheWay(key)) { showError(why); return; }
+    var back = liveNow(key), input = el("adv_" + key);
+    if (input) input.value = shown(back);
+    showError(why + " (the running world keeps " + shown(back) + ").");
   }
-  /* the world took v for key: the run's record (runCfg, its history); maxPopulation's record is userCap (applyLive) */
-  function liveApplied(key, v, quiet) {
-    if (key === "maxPopulation") {
-      if (!quiet) showNote((LABELS[key] || key) + " is now " + userCap + " (live)");
-      return;
-    }
-    if (v !== (key in runCfg ? runCfg[key] : ADV_BY_KEY[key][1])) liveEdited = true;
-    runCfg[key] = v; updateModeline();
-    if (!quiet) showNote((LABELS[key] || key) + " is now " + v + " (live)");
+  /* The world took a value for key. cfg: its whole config as the engine holds
+   * it now (engineConfig here, the worker's own in its answer), the run's
+   * record: the engine normalizes what it is given (whole numbers cut, the
+   * speeds put in order), so the record, the fields and the notes say what
+   * runs. The fields of what changed follow it, unless a newer value is on its
+   * way (or, for another field, the visitor is in it). maxPopulation's record
+   * is userCap (applyLive). */
+  function liveApplied(key, quiet, cfg) {
+    var prev = runCfg;
+    runCfg = cfg;
+    var moved = Object.keys(LIVE).filter(function (k) { return k !== "maxPopulation" && !sameVal(cfgOr(prev, k), cfgOr(runCfg, k)); });
+    if (moved.length) liveEdited = true;   /* (the run's history changes only with a value: a stepper clamped at its bound still fires change) */
+    if (key !== "maxPopulation" && moved.indexOf(key) < 0) moved.push(key);
+    moved.forEach(function (k) {
+      var input = el("adv_" + k);
+      if (!input || onTheWay(k) || (k !== key && document.activeElement === input)) return;
+      if (!sameVal(input.value, liveNow(k))) input.value = shown(liveNow(k));
+    });
+    updateModeline();
+    if (!quiet) showNote((LABELS[key] || key) + " is now " + shown(liveNow(key)) + " (live)");
   }
-  /* what was held for Turbo's start or hand-back, now to wherever the world is (in the order typed) */
+  /* what was held for Turbo's start or hand-back, now to wherever the world is, in the order typed: one at a time,
+   * so a refusal sees the newer values of its key still waiting behind it (and leaves their field alone) */
   function flushHeld() {
-    heldLive.splice(0).forEach(function (h) { sendLive(h.key, h.value, h.quiet); });
+    while (heldLive.length && engineOk()) {
+      var h = heldLive.shift();
+      sendLive(h.key, h.value, h.quiet);
+    }
   }
+  /* the running world's config as the engine holds it: its checkpoint's (the module has no other way to say it;
+   * a read of the world's state, ~9 ms at 300 fish, ~90 ms at 6000), after a start, a load and an accepted live value */
+  function engineConfig() { return JSON.parse(Module.UTF8ToString(Module._evo_checkpoint())).config || {}; }
+  function cfgOr(c, k) { return Object.prototype.hasOwnProperty.call(c, k) ? c[k] : ADV_BY_KEY[k] ? ADV_BY_KEY[k][1] : undefined; }
+  /* a setting's value as the page says it: the engine keeps most as 32-bit floats (1.7 runs as 1.70000005), seven digits show them */
+  function shown(v) { return typeof v === "number" && Number.isFinite(v) && !Number.isInteger(v) ? String(+v.toPrecision(7)) : String(v); }
+  function sameVal(a, b) {
+    var x = typeof a === "number" ? a : parseFloat(a), y = typeof b === "number" ? b : parseFloat(b);
+    return Number.isFinite(x) && Number.isFinite(y) ? shown(x) === shown(y) : String(a) === String(b);
+  }
+  /* the engine is there and running: every call into the module checks it (a trap stops it: engineStopped) */
+  function engineOk() { return !!Module && !engineDown; }
+  function threadCount() { return engineOk() && Module._evo_threads ? Module._evo_threads() : "?"; }
   var tabsEl = el("tabs"), panelsEl = el("panels"), currentTab = "run";
   /* the settings' tabs (web/ui_common.js tabs, as the Ocean's): Left / Right
    * round the ends, Home / End, the focus going with the selection; a
@@ -669,7 +704,7 @@
   }
 
   function restart() {
-    if (!Module) return false;
+    if (!engineOk()) return false;
     if (guardTurbo()) return false;
     clearError();
     var f = readForm();
@@ -723,14 +758,14 @@
     return (LABELS[key] || key) + " " + shown;
   }
   /* a live key's value in the running world (maxPopulation: the user's cap, userCap), and when it started */
-  function liveNow(k) { return k === "maxPopulation" ? userCap : k in runCfg ? runCfg[k] : ADV_BY_KEY[k][1]; }
-  function liveAtStart(k) { return k === "maxPopulation" ? startCap : k in startCfg ? startCfg[k] : ADV_BY_KEY[k][1]; }
+  function liveNow(k) { return k === "maxPopulation" ? userCap : cfgOr(runCfg, k); }
+  function liveAtStart(k) { return k === "maxPopulation" ? startCap : cfgOr(startCfg, k); }
   /* the live settings changed since this world started (accepted ones) */
   function liveTweaks() {
-    return Object.keys(LIVE).filter(function (k) { return liveNow(k) !== liveAtStart(k); });
+    return Object.keys(LIVE).filter(function (k) { return !sameVal(liveNow(k), liveAtStart(k)); });
   }
   function runAge() {
-    if (!Module) return 0;
+    if (!engineOk()) return 0;
     return new Float64Array(heap(), Module._evo_stats(), 4)[3] * DT;   /* (the world's frame, as the last sync left it) */
   }
   function fmtTime(s) { s = Math.max(0, Math.round(s)); var m = Math.floor(s / 60); return m ? m + " min " + (s % 60) + " s" : s + " s"; }
@@ -757,7 +792,7 @@
     if (age >= 300) lose.push(fmtTime(age) + " of evolution");
     if (usedTurbo) lose.push("what Turbo ran");
     var s = function (n) { return n === 1 ? "" : "s"; };
-    var mine = function (ks) { return ks.map(function (k) { return (LABELS[k] || k) + " " + liveNow(k); }).join(", "); };
+    var mine = function (ks) { return ks.map(function (k) { return (LABELS[k] || k) + " " + shown(liveNow(k)); }).join(", "); };
     var keys = function (l) { return l.map(function (e) { return e[0]; }); };
     var msg = "This replaces your run" + (lose.length ? ", and " + lose.join(" and ") + " with it" : "") + ".", yes = "Replace it";
     if (kind === "load") {
@@ -767,11 +802,11 @@
     } else {
       var list = diff.slice(0, 3).map(fieldText).join(", ") + (diff.length > 3 ? " and " + (diff.length - 3) + " more" : "");
       var kept = [], other = [];
-      tw.forEach(function (k) { var next = x.next(k); (next === liveNow(k) ? kept : other).push([k, next]); });
+      tw.forEach(function (k) { var next = x.next(k); (sameVal(next, liveNow(k)) ? kept : other).push([k, next]); });
       msg += (kind === "random" ? " It starts " + x.what + "." + (diff.length ? " What waits for the next start is dropped." : "")
                                 : diff.length ? " It starts with what waits: " + list + "." : "") +
         (kept.length ? " Your live tweak" + s(kept.length) + " (" + mine(keys(kept)) + ") " + (kept.length === 1 ? "carries" : "carry") + " over to the new world." : "") +
-        (other.length ? " The new world's setup sets " + other.map(function (e) { return (LABELS[e[0]] || e[0]) + " " + e[1]; }).join(", ") +
+        (other.length ? " The new world's setup sets " + other.map(function (e) { return (LABELS[e[0]] || e[0]) + " " + shown(e[1]); }).join(", ") +
                         " instead of your live tweak" + s(other.length) + " (" + mine(keys(other)) + ")." : "");
     }
     showAsk(msg, yes, "Keep it");
@@ -806,12 +841,12 @@
   }
   /* the entry points: each checks Turbo first (as before), then goes or asks */
   function requestRestart() {
-    if (!Module || engineDown || guardTurbo()) return "refused";
+    if (!engineOk() || guardTurbo()) return "refused";
     return replaceRun("restart", restart, { next: function (k) { return startValue(readForm().cfg, k); } });
   }
   /* R: a new seed, the rest as the sheet says */
   function requestNewSeed() {
-    if (!Module || engineDown || guardTurbo()) return "refused";
+    if (!engineOk() || guardTurbo()) return "refused";
     var seed = (Math.random() * 0x100000000) >>> 0;
     return replaceRun("restart", function () { el("seed").value = String(seed); restart(); },
                       { next: function (k) { return startValue(readForm().cfg, k); } });
@@ -832,7 +867,7 @@
   }
   /* the draw first, so the question (replaceRun) can say what it sets; the form only on the start */
   function randomize() {
-    if (!Module || engineDown || !window.EvoRandom || guardTurbo()) return "refused";
+    if (!engineOk() || !window.EvoRandom || guardTurbo()) return "refused";
     var pick = EvoRandom.draw(Math.random, basePop);
     var seed = (Math.random() * 0x100000000) >>> 0;
     var what = pick.population + " fish" + (pick.labels.length ? " · " + pick.labels.join(" · ") : " · the default world");
@@ -874,8 +909,8 @@
     resetGovernor();
     if (!ok) showError("evo_init failed: " + Module.UTF8ToString(Module._evo_last_error()));
     else {
-      runCfg = cfg; governed = false; liveEdited = false; loadedRun = false; updateModeline(); if (dash()) dash().reset();   /* a new run: new charts */
-      startCfg = Object.assign({}, cfg); startCap = userCap; usedTurbo = false;   /* (what the replace rule compares with) */
+      runCfg = engineConfig(); governed = false; liveEdited = false; loadedRun = false; updateModeline(); if (dash()) dash().reset();   /* a new run: new charts */
+      startCfg = Object.assign({}, runCfg); startCap = userCap; usedTurbo = false;   /* (what the replace rule compares with) */
       brainClock.reset(worldTick(), true);   /* (tick 0: no fish has run its brain yet) */
     }
     return !!ok;
@@ -1300,7 +1335,7 @@
   }
   /* the effective cap into the world (sendLive: Turbo's worker while it owns the world); quiet unless false */
   function applyCap(quiet) {
-    if (!Module || !Module._evo_set_param) return;
+    if (!engineOk() || !Module._evo_set_param) return;
     var eff = userCap > 0 && autoCap > 0 ? Math.min(userCap, autoCap) : (userCap || autoCap);
     sendLive("maxPopulation", eff, quiet !== false);
   }
@@ -1371,7 +1406,7 @@
   function renderStatPanel() {
     var st = lastStats, p = el("statpanel");
     if (!st || !Module) { p.textContent = "Starting…"; return; }
-    var mode = threaded ? "threaded × " + (Module._evo_threads ? Module._evo_threads() : "?") : "single-threaded";
+    var mode = threaded ? "threaded × " + threadCount() : "single-threaded";
     var cap = userCap > 0 && autoCap > 0 ? Math.min(userCap, autoCap) : (userCap || autoCap);
     var rows = [
       ["Fish", fmtNum(st[0])], ["Food", fmtNum(st[1])], ["Predators", fmtNum(st[2])],
@@ -1418,7 +1453,7 @@
    * freezing the page silently (engineStopped), as the Ocean's frame does. */
   function frame(now) {
     requestAnimationFrame(frame);
-    if (!Module || engineDown) return;   /* (stopped: nothing more is stepped or read) */
+    if (!engineOk()) return;   /* (stopped: nothing more is stepped or read) */
     try { frameBody(now); }
     catch (err) { if (err instanceof WebAssembly.RuntimeError) { engineStopped(err); return; } throw err; }
   }
@@ -1431,6 +1466,9 @@
     console.error("evo_boids: the engine stopped: " + why);
     if (dash()) dash().close();   /* (its timer reads the module) */
     if (asking) hideAsk();
+    dropWorker();   /* (Turbo's world has nowhere to come back to) */
+    heldLive = []; sentLive = []; turboAcked = [];
+    if (turboState !== "live") { turboState = "live"; updateLocks(); }
     showError("The engine stopped (" + why + "), so this world can't go on. Reload the page to go on.");
     failScreen("The engine stopped (" + why + "), so this world can't go on.\nReload the page to go on.", true);
   }
@@ -1586,7 +1624,7 @@
 
   /* ---- checkpoint save/load ---- */
   function saveCheckpoint() {
-    if (!Module) return;
+    if (!engineOk()) return;
     if (guardTurbo()) return;
     var str = Module.UTF8ToString(Module._evo_checkpoint());
     var frameNo = Math.round(new Float64Array(heap(), Module._evo_stats(), STATS_LEN)[3]);
@@ -1605,14 +1643,15 @@
    * carry on; a file is a new run, so they start over. Returns whether the
    * module took it (a refusal leaves the running world, and its history, as they were). */
   function loadCheckpointText(text, fromTurbo) {
+    if (!engineOk()) return false;
     var ok = withCString(text, function (ptr) { return Module._evo_load_checkpoint(ptr); });
     if (!ok) {
       showError("Couldn't load that checkpoint: " + Module.UTF8ToString(Module._evo_last_error()));
       return false;
     }
+    runCfg = engineConfig();   /* (what the engine took from the file: a floor of 0.5 runs as 0; Turbo's: the worker's world's) */
     if (!fromTurbo) {
       governed = false; liveEdited = false; loadedRun = true;   /* (updateModeline: the caller's, after the governor's reset) */
-      try { runCfg = JSON.parse(text).config || {}; } catch (e) { runCfg = {}; }
       startCfg = Object.assign({}, runCfg); usedTurbo = false;   /* (startCap: the caller's, with the file's cap) */
       if (dash()) dash().reset();
       if (Module._evo_rec_reset) Module._evo_rec_reset(1);   /* the loaded fish, as the tree's roots */
@@ -1676,8 +1715,13 @@
     } else if (msg.type === "set") {
       /* the worker's answer to a live value (sendLive): applied there, so the run's record has it (the hand-back's
        * checkpoint carries the world's config); refused; or no world there any more (held, or applied here) */
-      if (inFlight[msg.key] > 0) inFlight[msg.key]--;
-      if (msg.ok) { turboAcked.push({ key: msg.key, value: msg.value }); liveApplied(msg.key, msg.value, msg.quiet); }
+      answered(msg.key);
+      if (msg.ok) {
+        turboAcked.push({ key: msg.key, value: msg.value });
+        var cfg = msg.config;   /* (the worker's engine's own config, read after it applied the value) */
+        if (!cfg) { cfg = Object.assign({}, runCfg); cfg[msg.key] = msg.value; }
+        liveApplied(msg.key, msg.quiet, cfg);
+      }
       else if (msg.notRunning) { if (turboState === "turbo") heldLive.push({ key: msg.key, value: msg.value, quiet: msg.quiet }); else sendLive(msg.key, msg.value, msg.quiet); }
       else liveRefused(msg.key, msg.error || "Turbo refused " + msg.key, msg.quiet);
     } else if (msg.type === "rec") {
@@ -1690,8 +1734,8 @@
       var back = loadCheckpointText(msg.json, true);
       setPaused(false);             /* turbo implies running; come back un-paused */
       updateLocks();
-      if (back) showNote("Turbo ran " + (turboStats ? turboStats.totalSteps.toLocaleString() : 0) + " steps.");
-      else turboAcked.splice(0).forEach(function (a) { sendLive(a.key, a.value, true); });
+      if (back) { showNote("Turbo ran " + (turboStats ? turboStats.totalSteps.toLocaleString() : 0) + " steps."); turboAcked = []; }
+      recoverLive();                /* (every answer came before the checkpoint: nothing is unanswered; refused, the page's copy takes them) */
       flushHeld();                  /* values typed while it handed back: into the world it handed back */
     } else if (msg.type === "error") {
       showError("Turbo stopped: " + (msg.message || "unknown error"));
@@ -1699,23 +1743,35 @@
     }
   }
   /* Turbo ended without handing the world back: this page's copy, from where
-   * Turbo took it, runs on. It takes the live values the worker had applied
-   * (the run's record has them), then those held for the hand-off. The worker
-   * goes (a failed one may never start again); the next Turbo makes a new one. */
+   * Turbo took it, runs on. The worker goes (a failed one may never start
+   * again); the next Turbo makes a new one. */
   function turboLost() {
     turboState = "live";
-    if (turboWorker) { turboWorker.onmessage = turboWorker.onerror = null; turboWorker.terminate(); turboWorker = null; }
-    inFlight = {};   /* (no answer comes now) */
+    dropWorker();
     updateLocks();
-    turboAcked.splice(0).forEach(function (a) { sendLive(a.key, a.value, true); });
+    recoverLive();
     flushHeld();
   }
+  function dropWorker() {
+    if (turboWorker) { turboWorker.onmessage = turboWorker.onerror = null; turboWorker.terminate(); turboWorker = null; }
+  }
+  /* the world Turbo had is lost: this page's copy takes the live values the worker applied (the run's record has them:
+   * quietly), and the ones it never answered go first in line for it (held: applied here and said, or refused and
+   * their field put back), before the ones typed while Turbo started or handed back */
+  function recoverLive() {
+    turboAcked.splice(0).forEach(function (a) { sendLive(a.key, a.value, true); });
+    heldLive = sentLive.splice(0).concat(heldLive);
+  }
+  /* the worker answered a value of key: the first one of it sent (it answers in the order sent) */
+  function answered(key) {
+    for (var i = 0; i < sentLive.length; i++) if (sentLive[i].key === key) { sentLive.splice(i, 1); return; }
+  }
   function enterTurbo() {
-    if (turboState !== "live" || !Module || engineDown) return;
+    if (turboState !== "live" || !engineOk()) return;
     if (asking) hideAsk();   /* (its start would be refused now: Stop Turbo first) */
     turboState = "entering";
     turboStats = null;
-    turboAcked = []; inFlight = {};
+    turboAcked = []; sentLive = [];
     selectedId = null; /* ids will be stale by exit */
     updateLocks();
     if (!turboWorker) { /* created once, reused across sessions */
@@ -1745,7 +1801,7 @@
 
   /* ---- input ---- */
   canvas.addEventListener("click", function (e) {
-    if (!Module || turboState !== "live") return;
+    if (!engineOk() || turboState !== "live") return;
     var rect = canvas.getBoundingClientRect();
     var wx = (e.clientX - rect.left) * (canvas.width / rect.width);
     var wy = (e.clientY - rect.top) * (canvas.height / rect.height);
@@ -1784,7 +1840,7 @@
     if (!tap || e.pointerId !== tap.id) return;
     var moved = Math.hypot(e.clientX - tap.x, e.clientY - tap.y), held = performance.now() - tap.t;
     tap = null;
-    if (moved > 8 || held > 600 || !view3d || !Module || turboState !== "live") return;
+    if (moved > 8 || held > 600 || !view3d || !engineOk() || turboState !== "live") return;
     var best = scene.pick(snapshot(-1), e.clientX, e.clientY, e.pointerType === "mouse" ? 18 : 30);
     selectedId = best >= 0 ? fishId(best) : null;
     if (best >= 0) everSelected = true;
@@ -2190,7 +2246,7 @@
    * from one or the other (evo_set_colour_mode), and the run is the same. */
   var COLOUR_KEY = "evo_boids.colourBy", colourBrain = false;
   function applyColourMode() {
-    if (!Module || !Module._evo_set_colour_mode) return;
+    if (!engineOk() || !Module._evo_set_colour_mode) return;
     Module._evo_set_colour_mode(colourBrain ? 0 : 1);
     Module._evo_sync();
   }
@@ -2250,9 +2306,9 @@
     var file = this.files && this.files[0], opener = fileOpener;
     fileOpener = null;
     this.value = "";
-    if (!file || !Module || engineDown || guardTurbo()) return;
+    if (!file || !engineOk() || guardTurbo()) return;
     file.text().then(function (text) {
-      if (!Module || engineDown || guardTurbo()) return;   /* (the engine stopped, or Turbo started, while it was read) */
+      if (!engineOk() || guardTurbo()) return;   /* (the engine stopped, or Turbo started, while it was read) */
       var w = savedWorld(text, file.name);
       if (w.bad) { showError("Couldn't load that checkpoint: " + w.bad + ". Nothing changed."); return; }
       if (replaceRun("load", function () { openWorld(text); }, { world: w.what }) === "asked" && opener) {
@@ -2261,11 +2317,10 @@
     }, function (err) { showError("Couldn't read that file: " + err); });
   });
   function openWorld(text) {
-    if (!Module || engineDown || guardTurbo()) return;
+    if (!engineOk() || guardTurbo()) return;
     if (!loadCheckpointText(text)) return;   /* refused: the running world, its cap and its governor stay */
-    /* the file's own cap becomes the user cap; the governor starts fresh */
-    var cap = 0;
-    try { cap = (JSON.parse(text).config || {}).maxPopulation || 0; } catch (e) { /* load reported it */ }
+    /* the file's own cap (as the engine took it) becomes the user cap; the governor starts fresh */
+    var cap = runCfg.maxPopulation || 0;
     userCap = cap;
     startCap = cap;   /* (the loaded world's own: no live tweak yet) */
     autoCap = 0;
@@ -2300,7 +2355,7 @@
     /* fish coloured by brain similarity (else by family line) */
     colourByBrain: function () { return colourBrain; },
     /* the Turbo intro's "Try Turbo" */
-    startTurbo: function () { if (Module && !engineDown && turboState === "live") enterTurbo(); },
+    startTurbo: function () { if (engineOk() && turboState === "live") enterTurbo(); },
     setDrawer: setDrawer,
     setSheetTab: setSheetTab,
     /* Selects a fish for the guide to show, unless one is selected: the one
@@ -2308,7 +2363,7 @@
      * right. Leaves everSelected alone, so the one-time hint still comes until
      * the visitor picks one. */
     inspectSomeFish: function () {
-      if (!Module || engineDown || turboState !== "live") return false;
+      if (!engineOk() || turboState !== "live") return false;
       if (selectedId !== null) return true;
       var best = nearestFish(WORLD_W * (view3d ? 0.4 : 0.35), WORLD_H * (view3d ? 0.45 : 0.5), Infinity);
       if (best < 0) return false;
@@ -2339,6 +2394,8 @@
     st.className = "error";
     sp.classList.add("failed");
     sp.classList.remove("done");
+    /* the page behind it is inert: no pointer, focus or key reaches its controls (the module is fenced as well: engineOk) */
+    Array.prototype.forEach.call(document.body.children, function (c) { if (c !== sp) c.setAttribute("inert", ""); });
     var acts = document.createElement("div"), ways = [];
     acts.className = "splash-acts";
     if (!noOcean) {
@@ -2380,6 +2437,7 @@
       showFamilyColours: function () { setColourBrain(false, true); },
       /* the sampling interval, here and in a running Turbo worker */
       setRecEvery: function (every) {
+        if (!engineOk()) return;
         Module._evo_rec_config(every, -1);
         if (turboWorker && (turboState === "entering" || turboState === "turbo"))
           turboWorker.postMessage({ cmd: "rec", every: every });
@@ -2430,7 +2488,7 @@
     ml.dataset.replay = why.length ? "no" : "yes";
     ml.dataset.why = why.join(" ");
     ml.textContent = (threaded
-      ? "Running the threaded module (" + Module._evo_threads() + " threads): fast, not reproducible from the seed."
+      ? "Running the threaded module (" + threadCount() + " threads): fast, not reproducible from the seed."
       : "Running the single-threaded module (" + threadWhy + "): " + replayClaim() + ".") +
       " Drawing: " + drawingName() + ".";
   }
