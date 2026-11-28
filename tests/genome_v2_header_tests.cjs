@@ -5,7 +5,7 @@ const vm = require('node:vm');
 const fs = require('node:fs');
 const path = require('node:path');
 const ROOT = path.resolve(__dirname, '..');
-const H = require(path.join(ROOT, 'web/ocean_handoff.js'));
+const H = require(path.resolve(process.argv[2] || path.join(ROOT, 'web/ocean_handoff.js')));
 const heap = new ArrayBuffer(65536);
 new Float64Array(heap, 8, 2).set([0, 12]);
 const M = {
@@ -31,12 +31,19 @@ function worldFile(text) {
 const clean = JSON.stringify(head);
 H.worldHeader(worldFile(clean));
 assert.throws(()=>H.worldHeader(worldFile(clean.replace('"genomeVersion":2','"genomeVersion":1,"genomeVersion":2'))),/repeated brain policy member/,'header duplicate');
-for (const [label, text] of [
- ['parent', clean.replace('"start":', '"start":{},"start":')],
- ['runCfg', clean.replace('"start":', '"runCfg":{"genomeVersion":2},"runCfg":{"genomeVersion":1},"start":')],
- ['ordinary', clean.replace('"bytes":65536', '"bytes":65536,"bytes":65536')],
- ['escaped', clean.replace('"bytes":65536', '"by\\u0074es":65536,"bytes":65536')]
-]) assert.throws(()=>H.worldHeader(worldFile(text)),/repeated header member/,label);
+// Ordinary repeats and repeated parents keep main's JSON.parse (last wins).
+for (const text of [
+ clean.replace('"start":', '"start":{},"start":'),
+ clean.replace('"start":', '"runCfg":{"genomeVersion":2},"runCfg":{"genomeVersion":1},"start":'),
+ clean.replace('"bytes":65536', '"bytes":65536,"bytes":65536'),
+ clean.replace('"bytes":65536', '"by\\u0074es":65536,"bytes":65536')
+]) assert.deepEqual(H.worldHeader(worldFile(text)).header, JSON.parse(text));
+for (const [path, text] of [
+ ['start.cfg', clean.replace('"genomeVersion":2','"genomeVersion":1,"genomeVersion":2')],
+ ['runCfg', clean.replace('"start":', '"runCfg":{"biasGenes":false,"biasGenes":true},"start":')],
+ ['setup.config', clean.replace('"start":', '"setup":{"config":{"hiddenNeurons":12,"hiddenNeurons":12}},"start":')],
+ ['escaped policy', clean.replace('"genomeVersion":2','"genome\\u0056ersion":1,"genomeVersion":2')]
+]) assert.throws(()=>H.worldHeader(worldFile(text)), /repeated brain policy member/, path);
 const ctx=vm.createContext({Math});
 vm.runInContext(fs.readFileSync(path.join(ROOT,'web/ui_common.js'),'utf8'),ctx);
 for (const [w,h] of [[640,300],[300,640]]) {

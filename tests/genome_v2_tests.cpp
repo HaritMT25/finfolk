@@ -71,20 +71,41 @@ void readerRefusals() {
         const auto before = configBytes(c);
         std::vector<const char*> cases = {
             R"({"config":{"hiddenNeurons":12.5}})",
-            R"({"config":{"targetFood":321,"biasGenes":"yes"}})"
+            R"({"config":{"targetFood":321,"biasGenes":"yes"}})",
+            R"({"config":{"targetFood":321,"weightMutationMode":"bogus"}})",
+            R"({"config":{"targetFood":321,"genomeVersion":2,"brainEvalVersion":1}})"
         };
         if (v2) {
+            cases.push_back(R"({"config":{"targetFood":321,"targetFood":321}})");
             cases.push_back(R"({"config":{"targetFood":321,"weightMutationMode":"legacy"}})");
             cases.push_back(R"({"config":{"targetFood":80.5}})");
             cases.push_back(R"({"config":{"targetFood":"80"}})");
+        } else {
+            cases.push_back(R"({"config":{"targetFood":321,"genomeVersion":2}})");
         }
         for (const char* text : cases) {
             jsonm::Value root; std::string error;
             G2_CHECK(jsonm::Parser::parse(text, root, error), "direct reader fixture parses");
             G2_CHECK(!checkpoint::readConfig(root, c, error) && !error.empty(), "direct reader refusal");
             G2_CHECK(configBytes(c) == before, "direct reader preserves every config byte");
+            if (std::string(text).find("bogus") != std::string::npos)
+                G2_CHECK(error == "weightMutationMode must be legacy or saturating", "unknown policy diagnostic");
+            if (std::string(text).find("genomeVersion") != std::string::npos)
+                G2_CHECK(error == "genomeVersion=2 requires brainEvalVersion=2", "incompatible evaluation diagnostic");
+            if (std::string(text).find("targetFood\":321,\"targetFood") != std::string::npos)
+                G2_CHECK(error == "repeated config member targetFood", "duplicate non-policy diagnostic");
             if (std::string(text).find("80.5") != std::string::npos)
                 G2_CHECK(error == "targetFood must be a whole number that fits an int", "raw non-policy diagnostic");
+        }
+        if (!v2) {
+            // Main's v1 reader accepts ordinary repeated members. Only the
+            // targetFood field changes; policy and analysis settings survive.
+            SimConfig accepted = c;
+            c.targetFood = 321;
+            jsonm::Value root; std::string error;
+            G2_CHECK(jsonm::Parser::parse(R"({"config":{"targetFood":321,"targetFood":321}})", root, error), "v1 duplicate fixture parses");
+            G2_CHECK(checkpoint::readConfig(root, accepted, error) && error.empty(), "v1 duplicate acceptance matches main");
+            G2_CHECK(configBytes(accepted) == configBytes(c), "v1 duplicate exact config matches main");
         }
     }
 }

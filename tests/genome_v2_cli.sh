@@ -29,9 +29,13 @@ for name in ['v2.json','resumed.json']:
 PY
 # Policy flags on resume must never be silently discarded, even at defaults.
 for args in '--genome-version 2' '--brain-eval-version 2' '--bias-genes' '--hidden-neurons 12' '--weight-mutation-mode saturating'; do
-    if run --load-checkpoint v2.json $args --save-checkpoint forbidden.json; then exit 1; fi
-    grep -q 'use genome_v2_convert' run.log
-    test ! -e forbidden.json
+    for order in first last; do
+        resume=(--load-checkpoint v2.json $args)
+        if [ "$order" = first ]; then resume=($args --load-checkpoint v2.json); fi
+        if run "${resume[@]}" --save-checkpoint forbidden.json; then exit 1; fi
+        grep -q 'use genome_v2_convert' run.log
+        test ! -e forbidden.json
+    done
 done
 # Existing complete-token truncation for v1 and PR1 saturation remains.
 run --genome-max 80junk

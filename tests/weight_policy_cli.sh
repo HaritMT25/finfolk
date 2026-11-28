@@ -26,11 +26,15 @@ if run --weight-mutation-mode; then
     echo 'accepted missing policy argument' >&2; exit 1
 fi
 # Resume follows checkpoint policy; policy overrides require explicit conversion.
-if run --load-checkpoint absent.json --weight-mutation-mode saturating --save-checkpoint forbidden.json; then
-    echo "accepted ignored resume policy" >&2; exit 1
-fi
-grep -q "use genome_v2_convert" run.log
-test ! -e forbidden.json
+for order in first last; do
+    resume=(--load-checkpoint absent.json --weight-mutation-mode saturating)
+    if [ "$order" = first ]; then resume=(--weight-mutation-mode saturating --load-checkpoint absent.json); fi
+    if run "${resume[@]}" --save-checkpoint forbidden.json; then
+        echo "accepted ignored resume policy $order" >&2; exit 1
+    fi
+    grep -q "use genome_v2_convert" run.log
+    test ! -e forbidden.json
+done
 run --load-checkpoint absent.json --save-checkpoint resumed.json
 python3 - <<'PY'
 import json

@@ -47,6 +47,20 @@ inline void testGenomeV2() {
                      "policy refusal preserves all config bytes: %s", bad);
         }
     }
+    // Outer staging must publish accepted updates, including legacy-only input.
+    // A direct alias followed by unconditional assignment of the stale staged
+    // copy discards the parsed SimConfig even though the reader succeeds.
+    for (bool policyInput : {true, false}) {
+        SimConfig sim; OceanConfig ocean; std::string why;
+        const char* text = policyInput
+            ? R"({"genomeVersion":2,"brainEvalVersion":2,"weightMutationMode":"saturating","targetFood":321,"waveSpeed":9})"
+            : R"({"targetFood":321,"waveSpeed":9})";
+        t.expect(readOceanJson(text, sim, ocean, why), "accepted staging fixture");
+        t.expect(sim.targetFood == 321 && ocean.waveSpeed == 9 &&
+                 sim.genomeVersion == (policyInput ? 2 : 1),
+                 policyInput ? "accepted policy update publishes sim config"
+                             : "accepted legacy update publishes both configs");
+    }
     const char* policy=R"({"genomeVersion":2,"brainEvalVersion":2,"biasGenes":true,"weightMutationMode":"saturating","minPopulation":4,"maxPopulation":32})";
     SimConfig sc; OceanConfig oc; std::string error;
     t.expect(ofp::buildConfigs(policy,240,sc,oc,error),"v2 config: %s",error.c_str());

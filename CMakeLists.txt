@@ -161,7 +161,7 @@ add_executable(checkpoint_v3_validation tests/checkpoint_v3_validation.cpp)
 target_link_libraries(checkpoint_v3_validation PRIVATE evo_core)
 add_test(NAME checkpoint_v3_validation COMMAND checkpoint_v3_validation)
 
-foreach(g2_target genome_v2_codec genome_v2_tests genome_v2_frontend)
+foreach(g2_target genome_v2_codec genome_v2_tests genome_v2_frontend genome_v2_resume_compat)
     add_executable(${g2_target} tests/${g2_target}.cpp)
     target_link_libraries(${g2_target} PRIVATE evo_core)
     add_test(NAME ${g2_target} COMMAND ${g2_target})

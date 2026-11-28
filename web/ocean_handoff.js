@@ -580,8 +580,8 @@
       var policyKeys = ["genomeVersion", "biasGenes", "hiddenNeurons", "brainEvalVersion", "weightMutationMode"];
       parsedHeader.repeats.forEach(function (r) {
         var path = r.path.join(".");
-        var policy = policyKeys.indexOf(r.key) >= 0 && (path === "start.cfg" || path === "runCfg" || path === "setup.config");
-        throw new Error((policy ? "repeated brain policy member " : "repeated header member ") + r.key);
+        if (policyKeys.indexOf(r.key) >= 0 && (path === "start.cfg" || path === "runCfg" || path === "setup.config"))
+          throw new Error("repeated brain policy member " + r.key);
       });
       h = JSON.parse(headerText);
     } catch (e) { throw new Error("That world file is damaged: its header is not JSON (" + e.message + ")."); }

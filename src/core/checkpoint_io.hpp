@@ -1413,14 +1413,26 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
     if (width <= 0 || height <= 0) { error = "bad world dimensions"; return false; }
 
     // Config first: init() sizes the spatial grids from cfg.perceptionRadius.
-    world.cfg.weightMutationMode = WeightMutationMode::Legacy;
-    world.cfg.genomeVersion = 1;
-    world.cfg.biasGenes = false;
-    world.cfg.hiddenNeurons = 12;
-    world.cfg.brainEvalVersion = 1;
-    if (!readConfig(j, world.cfg, error)) { error = "config: " + error; return false; }
-    world.cfg.predatorBrain = brain;
-    if (const char* why = predatorBrainConfigError(world.cfg)) {
+    SimConfig nextCfg = world.cfg;
+    nextCfg.weightMutationMode = WeightMutationMode::Legacy;
+    nextCfg.genomeVersion = 1;
+    nextCfg.biasGenes = false;
+    nextCfg.hiddenNeurons = 12;
+    nextCfg.brainEvalVersion = 1;
+    // The incoming format determines the brain before policy validation.
+    // Brain-off writers omit these fields; stale Stage-C settings must not
+    // affect acceptance or the resumed config.
+    nextCfg.predatorBrain = brain;
+    if (!brain) {
+        const SimConfig defaults;
+        nextCfg.predatorMutation = defaults.predatorMutation;
+        nextCfg.predatorTurnRate = defaults.predatorTurnRate;
+        nextCfg.predatorMinSpeed = defaults.predatorMinSpeed;
+        nextCfg.predatorPrimer = defaults.predatorPrimer;
+        nextCfg.predatorFrozen = defaults.predatorFrozen;
+    }
+    if (!readConfig(j, nextCfg, error)) { error = "config: " + error; return false; }
+    if (const char* why = predatorBrainConfigError(nextCfg)) {
         error = std::string("config: ") + why;
         return false;
     }
@@ -1436,17 +1448,19 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
     // check would wave both straight through into rng.range — which then
     // returns NaN and turns every newborn body into NaN.
     // (Validated here rather than in readConfig, which is also used for partial and older config schemas.)
-    if (!(world.cfg.bodyMutation >= 0.0f) || !std::isfinite(world.cfg.bodyMutation)) {
+    if (!(nextCfg.bodyMutation >= 0.0f) || !std::isfinite(nextCfg.bodyMutation)) {
         error = "config 'bodyMutation' must be finite and >= 0";
         return false;
     }
     // Same rule, same reasons, for the predator trait mutation (v0.26.0): its
     // only legal writers (--predator-trait-mutation, evo_init) refuse negative
     // and non-finite values, and a NaN here would turn every bud's traits NaN.
-    if (!(world.cfg.predatorTraitMutation >= 0.0f) || !std::isfinite(world.cfg.predatorTraitMutation)) {
+    if (!(nextCfg.predatorTraitMutation >= 0.0f) || !std::isfinite(nextCfg.predatorTraitMutation)) {
         error = "config 'predatorTraitMutation' must be finite and >= 0";
         return false;
     }
+
+    world.cfg = nextCfg;
 
     // Build an empty world of the right geometry, then overwrite every piece of
     // state. init() draws from the rng (vortices, food patches), which is

@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <filesystem>
 #include <cerrno>
 #include <cstring>
@@ -9,6 +10,10 @@
 #include <iostream>
 #include "core/checkpoint_io.hpp"
 #include "core/genome_v2_conversion.hpp"
+
+#ifndef EVO_VERSION
+#define EVO_VERSION "dev"
+#endif
 
 int main(int argc, char** argv) {
     if (argc != 5 || (std::string(argv[4]) != "0" && std::string(argv[4]) != "1")) {
@@ -61,21 +66,23 @@ int main(int argc, char** argv) {
         else {
             failure = errno;
             if (failure == EPERM || failure == ENOTSUP || failure == EXDEV) {
-                // Filesystems without hard links still get exclusive, no-follow
-                // creation. Only our own incomplete output is removed on failure.
-                const int direct = ::open(output.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode);
-                if (direct < 0) failure = errno;
-                else {
-                    failure = writeAndClose(direct, false);
-                    if (failure) {
-                        if (::unlink(output.c_str()) != 0)
-                            std::cerr << "warning: could not remove incomplete checkpoint: " << std::strerror(errno) << '\n';
-                    } else published = true;
-                }
+                // The complete, synced sibling is the only writable file.
+                // A non-replacing rename consumes its name atomically; no
+                // fallback may expose incomplete bytes or remove output.
+#if defined(__linux__)
+                if (::renameat2(AT_FDCWD, temporary.data(), AT_FDCWD,
+                                output.c_str(), RENAME_NOREPLACE) == 0) {
+                    failure = 0;
+                    published = true;
+                    temporary.clear(); // rename consumed the temporary name
+                } else failure = errno;
+#else
+                failure = ENOTSUP;
+#endif
             }
         }
     }
-    if (::unlink(temporary.data()) != 0)
+    if (!temporary.empty() && ::unlink(temporary.data()) != 0)
         std::cerr << "warning: could not remove temporary checkpoint: " << std::strerror(errno) << '\n';
     if (published) {
         const int directory = ::open(output.parent_path().c_str(), O_RDONLY | O_DIRECTORY);
