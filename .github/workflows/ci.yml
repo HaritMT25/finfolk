@@ -155,6 +155,7 @@ jobs:
       - run: node tests/ui_common_tests.cjs
       - run: node tests/ui_parity_harness_tests.mjs
       - run: node tests/ui_inspector_tests.cjs
+      - run: node tests/ocean_setup_shape_tests.cjs
 
   # tools/redqueen (the Red Queen tournament tooling) on the Python versions it must run on: the
   # serial job's ctest runs it on the runner image's python3 (3.12); this job builds the serial app

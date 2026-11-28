@@ -241,7 +241,7 @@
     sideWallTurnRate: { d: "Glass walls: how fast a fish turns away, in radians per second, right at the glass (less further out). Restart to apply.", t: "try: 6 (the default); 2 for wide arcs" },
     width: { d: "The tank's size along x, in world units (the standard tank is 1920 x 1080). A bigger tank holds more fish at the same crowding; Big tank (on the Run tab) is a whole recipe for one. Restart to apply.", t: "try: 3840 with a length of 2160 (four times the area)" },
     height: { d: "The tank's size along y, in world units (shown front to back in the 3-D view). Restart to apply.", t: "try: 2160 with a width of 3840" },
-    bodyModel: { d: "Heritable body size and elongation: bigger = slower and costlier, longer = turns worse. The size laws (the Water tab) act on the size.", t: "try: on; founders start at 1.0 and bodies drift from births" },
+    bodyModel: { d: "Heritable body size and elongation: bigger = slower and costlier, longer = turns worse. The size laws just below (fights, drift) and Food › Who can eat (mouth size) act on the size.", t: "try: on; founders start at 1.0 and bodies drift from births" },
     maxPopulation: { d: "Birth cap: no births while the population is at or above it (0 = none). Applies live.", t: "try: 0, or 600 to keep a big run fast" },
     minPopulation: { d: "Reseed floor: random founders are added when the population falls below it. Applies live.", t: "try: 50 (the default)" },
     minSpeed: { d: "Minimum swim speed. Applies live.", t: "try: 0 when the swimming cost is above 0 (drifting allowed)" },

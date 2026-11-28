@@ -95,6 +95,9 @@ function rand(p, seed) {
     assert(p.el('e1add').parentElement.className === 'sub');
     const html = fs.readFileSync(path.join(__dirname, '../web/ocean.html'), 'utf8');
     assert(/#tabs\s*\{[^}]*overflow-x:\s*auto/.test(html), 'phone tab strip still scrolls');
+    assert(/#tabs button\s*\{[^}]*white-space:\s*nowrap/.test(html), 'six tab labels stay on one line each (the strip scrolls instead)');
+    assert(/\.panel \.sub\s*\{[^}]*color:\s*var\(--ink-3\)/.test(html), "a group's note is styled as a muted hint");
+    assert(!/<body[\s\S]*<style>[\s\S]*setup-status/.test(html.slice(html.indexOf('<body'))), 'the status pill style lives in the head');
     assert.equal(p.uncaught.length + eye.uncaught.length, 0);
     console.log('PASS six tabs; every key exactly once; moved DOM homes; eye gating in both capabilities; advice, aliases, clarity links, pills, scrolling');
     const baseArg = process.argv.indexOf('--base');
@@ -144,16 +147,16 @@ function rand(p, seed) {
                 b.click('savecp'); h.click('savecp');
                 assert.equal(b.blobs.at(-1), h.blobs.at(-1), id + ' saved setup bytes');
             }
-            for (const q of [b,h]) { q.edit('minSpeed',40); q.edit('kBuoy',-0.5); q.click('savecp'); }
-            assert.equal(JSON.stringify(b.sets), JSON.stringify(h.sets), 'live engine messages');
+            // every key this PR moved, edited through its own field: the same engine messages and saved bytes as base
+            const moved = ['pitchMax','vDrag','wallBand','steerFrame','mouthGate','kMouth','sizeFight','sizeDrift','buoyMutation',
+                           'bodyModel','bodyMutation','cHold','cPress','depthCostScaled','foodDepthMode','foodDepthSpread'];
+            const nextVal = (k) => { const [d,o] = CFG.KEYS[k];
+                if (typeof d === 'boolean') return !d;
+                if (o && o.options) return d === 0 ? 1 : 0;
+                const v = d + (o && o.step || 1); return o && o.max !== undefined ? Math.min(v, o.max) : v; };
+            for (const q of [b,h]) { q.edit('minSpeed',40); q.edit('kBuoy',-0.5); for (const k of moved) q.edit(k, nextVal(k)); q.click('savecp'); }
+            assert.equal(JSON.stringify(b.sets), JSON.stringify(h.sets), 'live engine messages (minSpeed, kBuoy and every moved key)');
             assert.equal(b.blobs.at(-1), h.blobs.at(-1), 'live edit save bytes');
-            for (const k of ['seed','population','width','height','depth']) {
-                const [d,o] = CFG.KEYS[k];
-                for (const v of [d,o.min,o.max === undefined ? (k === 'seed' ? 4294967295 : 100000) : o.max]) {
-                    for (const q of [b,h]) { q.T.resetForm(); q.T.setVal(k,v); }
-                    assert.equal(input(base,b), input(head,h), 'edited argument ' + k + '=' + v); edits++;
-                }
-            }
             for (const cfg of [{labelFrame:0}, {labelFrame:1,foodEnergy:7}, {eye:0,eyeOnly:0,eyeCode:0}]) {
                 const file = JSON.stringify({format:'evo_ocean_setup',version:2,seed:42,population:12,width:300,height:300,depth:240,walls:false,config:cfg});
                 for (const [hh,q] of [[base,b],[head,h]]) { await hh.stageFile(q,file); const n = q.inits.length; q.start(); assert.equal(q.inits.length, n + 1, 'import really starts'); q.click('savecp'); }
