@@ -484,7 +484,7 @@ inline bool readOceanJson(const char* json, SimConfig& simConfig, OceanConfig& o
                 return false;
             }
         }
-    checkpoint::readConfig(root, sc);
+    if (!checkpoint::readConfig(root, sc, err)) return false;
     if (const char* why = brainPolicyConfigError(sc)) {
         err = why;
         return false;

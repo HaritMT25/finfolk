@@ -5,11 +5,34 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#ifndef __EMSCRIPTEN__
+#include <csignal>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include "core/weight_log.hpp"
 #include "core/portable_math.hpp"
 #define CHECK(x, name) do { if (!(x)) { std::fprintf(stderr, "FAIL %s line %d\n", name, __LINE__); return 1; } } while (0)
 int main() {
     using namespace logweight;
+#ifndef __EMSCRIPTEN__
+    // Isolate fatal precondition checks; demand the trap signal, not any failure.
+    for (int guard = 0; guard < 3; ++guard) {
+        const pid_t child = fork();
+        CHECK(child >= 0, "codec death-test fork");
+        if (child == 0) {
+            const rlimit noCore{0, 0}; setrlimit(RLIMIT_CORE, &noCore);
+            if (guard == 0) { volatile float value = decodeValid(0x8000); (void)value; }
+            if (guard == 1) { volatile auto value = addMagnitude(25602, 0); (void)value; }
+            if (guard == 2) { volatile auto value = quantize(std::numeric_limits<double>::quiet_NaN()); (void)value; }
+            _exit(0);
+        }
+        int status = 0;
+        CHECK(waitpid(child, &status, 0) == child, "codec death-test wait");
+        CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGILL, "codec invalid input traps");
+    }
+#endif
     for (unsigned r = 0; r < 1024; ++r) {
         const float fraction = float(r) * 0x1p-10f;
         const float argument = fraction * 0x1.62e43p-1f;

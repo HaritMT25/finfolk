@@ -94,7 +94,7 @@ inline constexpr float kThrustAccel = 50.0f;
 
 static_assert(NUM_PRED_SENSES + MAX_INTERNAL_NEURONS <= (1 << NeuralNet::FlatConn::SRC_BITS),
               "predator source index space no longer fits in FlatConn::srcSink");
-static_assert(NUM_PRED_ACTIONS + MAX_INTERNAL_NEURONS <= (1 << (16 - NeuralNet::FlatConn::SRC_BITS)),
+static_assert(NUM_PRED_ACTIONS + MAX_INTERNAL_NEURONS <= (1 << (15 - NeuralNet::FlatConn::SRC_BITS)),
               "predator sink index space no longer fits in FlatConn::srcSink");
 
 // buildNeuralNet's algorithm with the predator's I/O sizes: genes remapped by

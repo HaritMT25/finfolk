@@ -43,5 +43,8 @@ int main() {
     // is deliberately preserved (the new policy is opt-in).
     G2_CHECK(evo_init(42,640,480,3,R"({"genomeMaxLength":80.5})")==1,"v1 lossy parsing retained");
     G2_CHECK(evo_init(42,640,480,3,R"({"genomeMaxLength":80.5,"weightMutationMode":"saturating"})")==1,"saturation only parsing retained");
+    G2_CHECK(evo_init(42,640,480,3,R"({"weightMutationMode":"saturating","genomeMinLength":80,"genomeMaxLength":16,"genomeInitMin":48,"genomeInitMax":24})")==1,"v1 pre-policy normalization retained");
+    G2_CHECK(g_world->cfg.genomeMinLength==16 && g_world->cfg.genomeMaxLength==80 &&
+             g_world->cfg.genomeInitMin==24 && g_world->cfg.genomeInitMax==48,"v1 normalized config identity");
     std::puts("genome v2 frontend: all assertions passed");
 }

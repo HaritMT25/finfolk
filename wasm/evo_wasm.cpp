@@ -385,7 +385,9 @@ EVO_EXPORT int evo_init(unsigned seed, int width, int height, int population,
             g_error = "config parse error: " + err;
             return 0;
         }
-        checkpoint::readConfig(root, cfg);
+        if (!checkpoint::readConfig(root, cfg, g_error, [](SimConfig& staged) {
+            if (staged.genomeVersion == 1) clampConfig(staged);
+        })) return 0;
     }
     if (cfg.genomeVersion != 1) {
         if (const char* why = brainPolicyConfigError(cfg)) { g_error = why; return 0; }
@@ -505,7 +507,9 @@ EVO_EXPORT int evo_set_param(const char* name, double value) {
     std::string err;
     if (!jsonm::Parser::parse(json, root, err)) { g_error = "internal: " + err; return 0; }
     SimConfig cfg = g_world->cfg;
-    checkpoint::readConfig(root, cfg);
+    if (!checkpoint::readConfig(root, cfg, g_error, [](SimConfig& staged) {
+            if (staged.genomeVersion == 1) clampConfig(staged);
+        })) return 0;
     if (cfg.genomeVersion != 1) {
         if (const char* why = brainPolicyConfigError(cfg)) { g_error = why; return 0; }
     }

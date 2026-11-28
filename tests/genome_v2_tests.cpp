@@ -60,6 +60,60 @@ template<int S, int A> void domain() {
         }
     }
 }
+// Serialize the complete object representation, including non-persisted settings.
+std::string configBytes(const SimConfig& c) {
+    return {reinterpret_cast<const char*>(&c), sizeof c};
+}
+void readerRefusals() {
+    for (bool v2 : {false, true}) {
+        SimConfig c = v2 ? config() : SimConfig{};
+        c.clusterMap = c.reproLog = true;
+        const auto before = configBytes(c);
+        std::vector<const char*> cases = {
+            R"({"config":{"hiddenNeurons":12.5}})",
+            R"({"config":{"targetFood":321,"biasGenes":"yes"}})"
+        };
+        if (v2) {
+            cases.push_back(R"({"config":{"targetFood":321,"weightMutationMode":"legacy"}})");
+            cases.push_back(R"({"config":{"targetFood":80.5}})");
+            cases.push_back(R"({"config":{"targetFood":"80"}})");
+        }
+        for (const char* text : cases) {
+            jsonm::Value root; std::string error;
+            G2_CHECK(jsonm::Parser::parse(text, root, error), "direct reader fixture parses");
+            G2_CHECK(!checkpoint::readConfig(root, c, error) && !error.empty(), "direct reader refusal");
+            G2_CHECK(configBytes(c) == before, "direct reader preserves every config byte");
+            if (std::string(text).find("80.5") != std::string::npos)
+                G2_CHECK(error == "targetFood must be a whole number that fits an int", "raw non-policy diagnostic");
+        }
+    }
+}
+void lateTransplantRefusal() {
+    World w; w.cfg = config(); w.cfg.predatorBrain = false;
+    w.cfg.predatorSpeed = 100; w.cfg.predatorMinSpeed = 101;
+    w.init(640, 480, 3);
+    G2_CHECK(!predatorBrainConfigError(w.cfg), "late transplant coherent receiver");
+    const auto before = configBytes(w.cfg), worldBefore = checkpoint::serialize(w, "test");
+    const auto rs = rng.state(), ps = w.predRng_.state();
+    transplant::Options options; options.predatorsFrom = "random"; options.count = 1;
+    std::string manifest, error;
+    G2_CHECK(!transplant::apply(w, options, "", manifest, error), "late transplant refusal");
+    G2_CHECK(error == "arena config: predatorMinSpeed must not exceed predatorSpeed", "late transplant reason");
+    G2_CHECK(configBytes(w.cfg) == before && checkpoint::serialize(w, "test") == worldBefore &&
+             rng.state() == rs && w.predRng_.state() == ps, "late transplant preserves config and RNG streams");
+}
+void lateConversionRefusal() {
+    World w; w.cfg.predatorBrain = true; w.cfg.predatorCount = 2; w.init(640, 480, 3);
+    // All prey and the first predator convert before the invalid last predator.
+    w.predators.back().genome.clear();
+    const auto before = checkpoint::serialize(w, "test"), cfgBefore = configBytes(w.cfg);
+    const auto rs = rng.state(), ps = w.predRng_.state();
+    std::string error;
+    G2_CHECK(!convertWorldToGenomeV2(w, true, std::string(64, 'a'), error), "late conversion refusal");
+    G2_CHECK(error == "invalid predator brain for conversion", "late conversion reason");
+    G2_CHECK(checkpoint::serialize(w, "test") == before && configBytes(w.cfg) == cfgBefore &&
+             rng.state() == rs && w.predRng_.state() == ps, "late conversion preserves serialized world");
+}
 void builders() {
     domain<41,12>(); domain<46,13>(); domain<64,13>(); domain<21,2>();
     Genome legacy{g2Gene(1,127,1,127,8192),g2Gene(0,127,0,127,32768)};
@@ -209,4 +263,4 @@ void conversion() {
     G2_CHECK(folded[33*predstats::kSink]==1,"predator bias fold");
 }
 }
-int main(){builders();recurrence();mutation();persistence();conversion();std::puts("genome v2: all assertions passed");}
+int main(){readerRefusals();lateTransplantRefusal();lateConversionRefusal();builders();recurrence();mutation();persistence();conversion();std::puts("genome v2: all assertions passed");}
