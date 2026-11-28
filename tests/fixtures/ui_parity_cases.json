@@ -127,7 +127,7 @@
         { "do": "key", "key": "End" },
         { "do": "shot", "name": "setup_tab_end", "expect": {
             "classic": { "focus": { "id": "tab-ocean", "ring": true }, "setup": { "selected": ["tab-ocean"], "tabbable": ["tab-ocean"] } },
-            "ocean": { "focus": { "id": "tab-senses", "ring": true }, "setup": { "selected": ["tab-senses"], "tabbable": ["tab-senses"] } } } },
+            "ocean": { "focus": { "id": "tab-ocean", "ring": true }, "setup": { "selected": ["tab-ocean"], "tabbable": ["tab-ocean"] } } } },
         { "do": "key", "key": "ArrowRight" },
         { "do": "shot", "name": "setup_tab_right_wrap", "expect": { "focus": { "id": "tab-run", "ring": true }, "setup": { "selected": ["tab-run"], "tabbable": ["tab-run"] } } },
         { "do": "click", "sel": "#tabs [role=tab]:nth-child(2)" },

@@ -41,7 +41,7 @@
 const fs = require('fs'), path = require('path'), vm = require('vm'), crypto = require('crypto'), os = require('os');
 const { resolveObjectURL } = require('buffer');
 
-const ROOT = path.resolve(__dirname, '..'), WEB = path.join(ROOT, 'web');
+const ROOT = path.resolve(__dirname, '..'), WEB = process.env.OCEAN_TEST_WEB || path.join(ROOT, 'web');
 const WASM = path.join(WEB, 'evo_ocean.wasm');
 const create = require(path.join(WEB, 'evo_ocean.js'));
 const HO = require(path.join(WEB, 'ocean_handoff.js'));
@@ -307,6 +307,7 @@ const PAGE_SRC = (() => {
         '    get draft() { return typeof draft === "undefined" ? null : draft; }, get draftGen() { return typeof draftGen === "undefined" ? 0 : draftGen; },\n' +
         '    pendingDiff: typeof pendingDiff === "function" ? pendingDiff : function () { return []; }, readForm: readForm,\n' +
         '    liveTweaks: typeof liveTweaks === "function" ? liveTweaks : function () { return []; },\n' +
+        '    resetForm: resetForm, cfgToForm: cfgToForm, setVal: setVal, updateNeeds: updateNeeds, stageScenario: stageScenario,\n' +
         '    getVal: getVal, importWorld: importWorld, wiringNow: readouts.wiringNow, frame: frame,\n' +
         '    get worldSave() { return typeof worldSave === "undefined" ? null : worldSave; }, get selectedId() { return inspector.selectedId; },\n' +
         '    get engineState() { return typeof engineState === "undefined" ? null : engineState; },\n' +
@@ -565,9 +566,9 @@ async function bootPage(query, opts) {
     PAGES.push(page);
     const { doc, Ev, fireOn } = makeDom(page);
     const loc = {};
-    const setLoc = (u) => { const x = new URL(u); Object.assign(loc, { href: x.href, search: x.search, origin: x.origin, protocol: x.protocol, pathname: x.pathname }); };
+    const setLoc = (u) => { const x = new URL(u); Object.assign(loc, { href: x.href, search: x.search, origin: x.origin, protocol: x.protocol, pathname: x.pathname, hash: x.hash }); };
     setLoc('http://ocean.test/ocean.html' + (query || ''));
-    const storage = new Map(), winLs = {}, mqs = new Map();
+    const storage = new Map(Object.entries(opts.storage || {})), winLs = {}, mqs = new Map();
     const say = (level) => (...a) => page.logs.push([level, a.map(String).join(' ')]);
     /* one MediaQueryList per query, as a browser's: its matches can change, and it tells its listeners */
     const matchMedia = (q) => {
@@ -622,6 +623,7 @@ async function bootPage(query, opts) {
         /* the glue's factory: the wasm the page's locateFile names (wasmFile), every instance's init and live calls logged */
         ctx.createEvoOcean = (o) => wasmFile(page, o && typeof o.locateFile === 'function' ? o.locateFile('evo_ocean.wasm', '') : null)
           .then((file) => create({ locateFile: p => p.endsWith('.wasm') ? file : p })).then((M) => {
+            if (opts.hasEye) M._oc_has_eye = () => 1;   /* capability-only UI test; no eye simulation */
             const init = M._oc_init, set = M._oc_set_param;
             M._oc_init = function (seed, w, h, d, pop, p) { page.inits.push(HO.cString(M, p)); return init.apply(this, arguments); };
             M._oc_set_param = function (p, v) {
@@ -2372,7 +2374,7 @@ async function pageTabKeys() {
     const t0 = tabSel();
     p.tabTo(p.el('tabs').children[t0].id);
     p.key('ArrowRight');
-    ok(at === 'Your own settings' && tabSel() === t0 + 1 && title() === 'Your own settings',
+    ok(at === 'Your own settings' && tabSel() === (t0 + 1) % p.el('tabs').children.length && title() === 'Your own settings',
        'the tour at "Your own settings", a settings tab focused: Right moves the tab (' + t0 + ' -> ' + tabSel() + ') and the tour stays (' + title() + ')');
     p.key('g');
     p.focusVisible = true; dt()[sel()].focus();
@@ -2398,7 +2400,7 @@ async function pageSetupTabs() {
     const roving = () => tabs().every((b, i) => b.tabIndex === (i === sel() ? 0 : -1));
     const shown = (b) => !p.el(b.getAttribute('aria-controls')).hidden;
     const n = tabs().length, speed = () => p.el('speedlabel').textContent;
-    ok(n >= 6 && tabs()[0].id === 'tab-run' && sel() === 0 && roving() && tabs().every(b => /^panel-/.test(b.getAttribute('aria-controls') || '')) &&
+    ok(n === 6 && tabs()[0].id === 'tab-run' && sel() === 0 && roving() && tabs().every(b => /^panel-/.test(b.getAttribute('aria-controls') || '')) &&
        tabs().filter(shown).length === 1 && shown(tabs()[0]),
        'built: ' + n + ' tabs, each controlling its panel; Run selected, only it in the Tab order, only its panel shown');
     p.tabTo('tab-run');
@@ -3003,8 +3005,8 @@ async function pageDraft() {
     }
 }
 
-/* Truthful Setup hints (steps 1-2 of the fact-check of the Argon UI answer): a field dims when the settings make it do
- * nothing; these assert which fields are dimmed and which are active in each state, never the prose.
+/* Truthful Setup hints (steps 1-2 of the fact-check of the Argon UI answer): dependent fields dim when the settings make them do
+ * nothing; entry switches use advisory hints. These assert which fields are dimmed and which are active in each state, never the prose.
  *   - Predators: predatorCount is only how many the world starts with; with their economy on, the floor
  *     (predatorMinPopulation > 0) adds hunters even from 0 (src/ocean/ocean_world.hpp: the step calls refillPredators when
  *     predatorEconomy and predatorMinPopulation > 0, and neither reads predatorCount). So the economy switch matters with
@@ -3033,7 +3035,7 @@ async function pageTruthfulHints() {
     /* the predator fields that do nothing with these settings (count, economy, floor, hunters inherit traits) */
     const idleP = (c, e, f, i) => {
         const hunters = c > 0 || (e && f > 0), acts = new Set();
-        if (c > 0 || f > 0) acts.add('predatorEconomy');
+        acts.add('predatorEconomy');   /* UX 3: entry switch always usable */
         if (hunters) HUNT.forEach(k => acts.add(k));
         if (hunters && e) ECON.forEach(k => acts.add(k));
         if (e) acts.add('predatorMinPopulation');
@@ -3077,13 +3079,13 @@ async function pageTruthfulHints() {
         /* (the dimming is worked out once the file is staged: before, a running world's hunters kept its live fields undimmed) */
         const r = await boot({ predatorCount: 3, predatorEconomy: true, predatorInheritance: true });   /* hunters now, from the start */
         await stageFile(r, file({}));                                                                  /* none in the file */
-        const noneFile = !!r.T.draft && same(dimmed(r, P), P);
+        const noneFile = !!r.T.draft && same(dimmed(r, P), P.filter(k => k !== 'predatorEconomy'));
         const q = await bootPage(PAGE_Q7);                                                           /* no predators at all now */
         await stageFile(q, file({ predatorEconomy: true, predatorMinPopulation: 2 }));
         const onFile = dimmed(q, P);
         ok(offFile && noneFile && !!q.T.draft && same(onFile, ['predatorTraitMutation']) && clean(p) && clean(q) && clean(r),
            'a staged file without the economy, hunters running from a floor: its floor, cap and trait mutation dim (' + offFile + '); a staged ' +
-           'file without predators, 3 running with their economy: every predator field dims, the live ones too (' + noneFile + '); a staged ' +
+           'file without predators, 3 running with their economy: every predator field except its entry switch dims, the live ones too (' + noneFile + '); a staged ' +
            'file with the economy and a floor of 2 from 0 starting predators, none running: dimmed ' + fmt(onFile));
     }
     {   /* appearance 0 / 1 / 2 / 3: patterns need bit 1, body shapes bit 2 */
@@ -3111,7 +3113,7 @@ async function pageTruthfulHints() {
                 p.edit('kMouth', k);
                 const gate = dimmed(p, ['mouthGate']).length === 1, size = dimmed(p, ['kMouth']).length === 1;
                 const want = k * (bodies ? 0.5 : 1) >= 1;   /* no fish's mouth is too small for a size-1 item */
-                if (gate !== want || size) good = false;
+                if (gate || size || noted(p, 'mouthGate') !== want) good = false;
                 rows.push((bodies ? 'evolving' : 'fixed') + ' x' + k + ': gate ' + (gate ? 'dimmed' : 'active'));
             }
             p.edit('mouthGate', false);
@@ -3121,14 +3123,14 @@ async function pageTruthfulHints() {
         /* both worlds: evolving bodies running at mouth size 1.5 (the smallest go hungry), bodies fixed typed for the next world */
         const p = await boot({ bodyModel: true, mouthGate: true, kMouth: 1.5 });
         p.edit('bodyModel', false);
-        const stillNow = dimmed(p, ['mouthGate']).length === 0 && noted(p, 'mouthGate');
-        ok(good && stillNow && clean(p), 'the mouth gate dims only where it can refuse nothing (food is size 1, a fish 0.5 to 2 with evolving ' +
+        const stillNow = dimmed(p, ['mouthGate']).length === 0 && /no effect in the next world.*it still acts on this one/.test(p.el('f_mouthGate').querySelector('.needs').textContent);
+        ok(good && stillNow && clean(p), 'the mouth gate stays usable and advises where it can refuse nothing (food is size 1, a fish 0.5 to 2 with evolving ' +
            'bodies): ' + rows.join(', ') + '; the size dims with the gate off; evolving bodies at 1.5 now, fixed next: the gate still acts now, ' +
            'usable and noted (' + stillNow + ')');
     }
     {   /* the thresholds as the engine sees them: kMouth is a float32 (ocean_config.hpp kMouth) and a fish eats unless
          * 1 > kMouth x size (ocean_world.hpp's food loop), so equality eats; a typed decimal that rounds up to the threshold is
-         * the threshold. [bodies evolving, kMouth typed, the gate dimmed?], each state written out, not computed */
+         * the threshold. [bodies evolving, kMouth typed, advisory hint shown?], each state written out, not computed */
         const EDGES = [[false, 1, true],             /* fixed bodies at the equality: 1 x 1 = 1 eats, nothing refused */
                        [false, 0.99999994, false],   /* float32 1 - 2^-24, just below: every fish refused */
                        [false, 0.99999999, true],    /* float32 1: the equality again */
@@ -3142,10 +3144,10 @@ async function pageTruthfulHints() {
             for (const [b, k, want] of EDGES) {
                 if (b !== bodies) continue;
                 p.edit('kMouth', k);
-                const gate = dimmed(p, ['mouthGate']).length === 1;
-                if (gate !== want || p.T.getVal('kMouth') !== k) good = false;
-                rows.push((bodies ? 'evolving' : 'fixed') + ' x' + k + ' (float32 ' + Math.fround(k) + '): gate ' + (gate ? 'dimmed' : 'active') +
-                          (gate === want ? '' : ' (should be ' + (want ? 'dimmed' : 'active') + ')'));
+                const gate = noted(p, 'mouthGate');
+                if (dimmed(p, ['mouthGate']).length || gate !== want || p.T.getVal('kMouth') !== k) good = false;
+                rows.push((bodies ? 'evolving' : 'fixed') + ' x' + k + ' (float32 ' + Math.fround(k) + '): hint ' + (gate ? 'shown' : 'absent') +
+                          (gate === want ? '' : ' (should be ' + (want ? 'shown' : 'absent') + ')'));
             }
             if (!clean(p)) good = false;
         }
@@ -5685,7 +5687,7 @@ async function pageSetupStateUX() {
        'the duplicate green summary is removed; card actions stack inside the card and the waiting marker is a hollow ring');
     ok(CFG.TABS.find(t => t.id === 'ocean').title === 'Water' && !tour.includes('Water (E1)') &&
        CFG.SCENARIOS.find(t => t.id === 'e1').blurb.startsWith('Starts a whole new world with living water') &&
-       js.includes('Add living water (waves, current, light)') && js.includes('Adds living water to the next world’s current rules.'),
+       js.includes('Add living water rules') && js.includes('Adds living water to the next world’s current rules.'),
        'Water naming is consistent; the recipe starts a whole world while the add button keeps the next world’s rules');
     ok(!p.uncaught.length, 'no exception escaped the Setup wording and state handlers' + (p.uncaught.length ? ': ' + p.uncaught[0] : ''));
     {   /* the rings follow the running world (review of #107): Replay with a recipe staged */
@@ -5748,6 +5750,8 @@ const SECTIONS = {
     review3Worker, review3Reads, review3Fence, review3Save,
     review4Fence, review4Reads, review5Bench, review6BenchImport
 };
+module.exports = { bootPage, CFG, HO, stageFile, until, SECTIONS, PAGES };
+if (require.main === module) {
 const unhandled = [];
 process.on('unhandledRejection', (e) => { unhandled.push(e); });
 (async () => {
@@ -5764,3 +5768,5 @@ process.on('unhandledRejection', (e) => { unhandled.push(e); });
     console.log('\n' + (checks - failures) + ' / ' + checks + ' checks passed in ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s');
     process.exit(failures ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(2); });
+
+}

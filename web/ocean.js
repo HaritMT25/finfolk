@@ -1008,29 +1008,62 @@
       discard.addEventListener("click", discardDraft);
       banner.appendChild(discard);
       panel.appendChild(banner);
-      if (tab.id === "ocean") panel.appendChild(presetBox());
+      if (tab.id === "ocean") panel.appendChild(waterIntro());
       tab.groups.forEach(function (g) {
+        /* Keep the config inputs, without rows or an Eye heading, until the
+         * module advertises the eye. This preserves every form/config path. */
+        if (g[0] === "Eye") {
+          var eye = document.createElement("div");
+          eye.id = "eye-settings"; eye.hidden = true;
+          g[1].forEach(function (k) {
+            var input = document.createElement("input");
+            input.id = "o_" + k;
+            input.type = (KEYS[k][1] || {}).bit ? "checkbox" : "number";
+            input.value = String(KEYS[k][0]); input.checked = !!KEYS[k][0];
+            eye.appendChild(input);
+          });
+          panel.appendChild(eye);
+          return;
+        }
         var h = document.createElement("h3");
         h.textContent = g[0];
+        if (g[0] === "Currents" || g[0] === "Waves" || g[0] === "Underwater light") {
+          var pill = document.createElement("span");
+          pill.className = "setup-status";
+          pill.textContent = g[0] === "Underwater light" ? "looks only" : "physics only · not drawn yet";
+          h.appendChild(pill);
+        }
         panel.appendChild(h);
+        if (g[0] === "Underwater light") {
+          var note = document.createElement("p");
+          note.className = "sub";
+          note.innerHTML = "Depth shading is softened by <button type='button' class='linkbtn' id='viewclarity'>View › Water clarity</button> and hidden by the flashlight.";
+          panel.appendChild(note);
+        }
         g[1].forEach(function (k) { panel.appendChild(makeField(k)); });
       });
       panelsEl.appendChild(panel);
     });
     el("panel-run").setAttribute("role", "tabpanel");   /* (its view switches are in the View menu now) */
     var saved = store("evo_boids.ocean.tab");
-    setSheetTab(saved && el("panel-" + saved) ? saved : "run");
+    setSheetTab(saved || "run");
+    function tabLink() {
+      var link = /^#tab-([a-z]+)$/.exec(location.hash);
+      if (!link) return;
+      var id = sheetTabId(link[1]);
+      if (id === "run" && link[1] !== "run") return;
+      setSheetTab(id); layers.setDrawer(true);
+    }
+    tabLink();
+    window.addEventListener("hashchange", tabLink);
   }
   /* the Water tab: the living water added to what the tabs hold (the
    * next world; the rest kept). The whole Living water world is a scenario
    * in Run › Start from. */
-  function presetBox() {
+  function waterIntro() {
     var box = document.createElement("div");
-    box.className = "preset";
-    box.innerHTML = "<button type='button' class='btn' id='e1add' title='Adds living water to the next world’s current rules.'><svg class='i'><use href='#i-plus'/></svg>Add living water (waves, current, light)</button>" +
-      "<p>Surface waves, a gentle deep current with food drifting in it, light that fades with depth, and depth costs scaled to each fish's " +
-      "metabolism, put into these tabs on top of the rest (predators, food, ... stay). They wait for the next start. The whole " +
-      "<b>Living water</b> world is in Run › Start from.</p>";
+    box.className = "sub";
+    box.innerHTML = "<button type='button' class='linkbtn' id='e1add' title='Adds living water to the next world’s current rules.'>Add living water rules</button> to the next world’s current rules.";
     box.querySelector("#e1add").addEventListener("click", fenced(function () {
       var p = e1Preset();
       if (!p) { showError(engineState !== "ok" ? "Living water: " + engineBusyWhy() + "." : "Living water is unavailable in this engine module (oc_e1_preset)"); return; }
@@ -1086,7 +1119,13 @@
   }
   /* a staged card's Start: the start bar's own dispatcher */
   function startStaged() { restart(); }
+  function sheetTabId(id) {
+    /* Water keeps its existing ocean id; accept its plain name as well. */
+    id = id === "depth" || id === "water" ? "ocean" : id === "senses" ? "world" : id;
+    return CFG.TABS.some(function (tab) { return tab.id === id; }) ? id : "run";
+  }
   function setSheetTab(id) {
+    id = sheetTabId(id);
     currentTab = id;
     sheetTabs.mark(id);
     CFG.TABS.forEach(function (tab) { el("panel-" + tab.id).hidden = tab.id !== id; });
@@ -1157,10 +1196,6 @@
       if (!hasCurrent()) return "needs a current (strength above 0)";
       return nv("currentMode") === 0 || nv("walls") ? "" : "needs the eddies shape, or glass walls (where it sets the current's fade at the glass)";
     }],
-    /* the economy switch also switches the floor's refill on: it matters with starting predators or a floor */
-    [["predatorEconomy"], function () {
-      return nv("predatorCount") > 0 || nv("predatorMinPopulation") > 0 ? "" : "needs predators above 0, or a predator floor above 0 (with the economy on, the floor adds hunters)";
-    }],
     [["predatorSpeed", "predatorPerception", "predatorCaptureRadius", "predatorCooldown"],
       function () { return hasHunters() ? "" : "needs predators above 0, or their economy on with a predator floor above 0"; }],
     [["predatorMeal", "predatorMetabolism", "predatorReproEnergy", "predatorMaxAge", "predatorMaxPopulation", "predatorInheritance"],
@@ -1180,17 +1215,6 @@
       if (!nv("bodyModel")) return "needs evolving bodies on (without them every fish is size 1)";
       return hasCurrent() || nv("waveSpeed") > 0 ? "" : "needs a current or waves to drift in";
     }],
-    /* food is size 1 (ocean_world.hpp OceanFood::size) and the gate refuses an
-     * item only when 1 > kMouth x the fish's size (the food loop's mouthGate
-     * test); a fish is size 1 without evolving bodies, 0.5 to 2 with them
-     * (src/core/body_model.hpp BODY_PARAM_MIN): so it can refuse anything only
-     * when kMouth x the smallest size is under 1 — never at the default 2, even
-     * with evolving bodies (kMouth is a float in the engine: fround) */
-    [["mouthGate"], function () {
-      var k = nv("kMouth"), small = nv("bodyModel") ? 0.5 : 1;
-      return Math.fround(k) * small >= 1 ? "no effect at mouth size × " + k + ": food is size 1 and every fish can eat it (" +
-        (small < 1 ? "the smallest fish is size 0.5)" : "every fish is size 1)") : "";
-    }],
     [["kMouth"], function () { return nv("mouthGate") ? "" : "needs the mouth gate on"; }],
     [["waveBand", "waveGravity"], function () { return nv("waveSpeed") > 0 ? "" : "needs waves (strength above 0)"; }],
     [["L0", "kWater"], function () { return nv("lightEnabled") ? "" : "needs the light field on"; }],
@@ -1208,8 +1232,27 @@
       return nv("eye") ? "" : "needs the compound eye on";
     }]
   ];
+  /* Advice never dims the entry switches: users can turn these on first. */
+  var ADVICE = [
+    [["predatorEconomy"], function () {
+      return nv("predatorCount") > 0 || nv("predatorMinPopulation") > 0 ? "" : "Pair with starting predators or a floor";
+    }],
+    /* food is size 1 (ocean_world.hpp OceanFood::size) and the gate refuses an
+     * item only when 1 > kMouth x the fish's size (the food loop's mouthGate
+     * test); a fish is size 1 without evolving bodies, 0.5 to 2 with them
+     * (src/core/body_model.hpp BODY_PARAM_MIN): so it can refuse anything only
+     * when kMouth x the smallest size is under 1 — never at the default 2, even
+     * with evolving bodies (kMouth is a float in the engine: fround) */
+    [["mouthGate"], function () {
+      if (!nv("mouthGate")) return "";
+      var k = nv("kMouth"), small = nv("bodyModel") ? 0.5 : 1;
+      return Math.fround(k) * small >= 1 ? "no effect at mouth size × " + k + ": food is size 1 and every fish can eat it (" +
+        (small < 1 ? "the smallest fish is size 0.5)" : "every fish is size 1)") : "";
+    }],
+  ];
   function updateNeeds() {
-    NEEDS.forEach(function (rule) {
+    NEEDS.concat(ADVICE).forEach(function (rule) {
+      var advisory = ADVICE.indexOf(rule) >= 0;
       var why = rule[1](), whyNow = "";
       if (why && !draft && initArgs && rule[0].some(function (k) { return LIVE[k]; })) {
         nvRunning = true;
@@ -1220,9 +1263,10 @@
         if (!row) return;
         var hint = row.querySelector(".needs");
         if (!hint) { hint = document.createElement("span"); hint.className = "needs"; row.appendChild(hint); }
-        var inert = !!why && !(LIVE[k] && !draft && initArgs && !whyNow);
+        var actsNow = LIVE[k] && !draft && initArgs && !whyNow;
+        var inert = !advisory && !!why && !actsNow;
         row.classList.toggle("inert", inert);
-        hint.textContent = inert ? why : why ? why.replace(/^needs/, "the next world needs").replace(/^no effect/, "no effect in the next world") +
+        hint.textContent = inert || (advisory && !actsNow) ? why : why ? why.replace(/^needs/, "the next world needs").replace(/^no effect/, "no effect in the next world") +
           "; it still acts on this one" : "";
       });
     });
@@ -3151,10 +3195,14 @@
               M._oc_pattern_law() === EvoAppearance.LAWS.patternLaw && M._oc_morphology_law() === EvoAppearance.LAWS.morphLaw;
     bodyDetect();
     HAS_EYE = has("oc_has_eye") && !!M._oc_has_eye();
-    if (!HAS_EYE) ["eye", "eyeOnly", "eyeCode"].forEach(function (k) {
-      var i = el("o_" + k); if (i) i.disabled = true;
-      var row = el("f_" + k); if (row) row.querySelectorAll(".stepper button").forEach(function (b) { b.disabled = true; });
-    });
+    if (HAS_EYE) {
+      var eye = el("eye-settings"), values = {};
+      ["eye", "eyeOnly", "eyeCode"].forEach(function (k) { values[k] = getVal(k); });
+      while (eye.firstChild) eye.removeChild(eye.firstChild);
+      var heading = document.createElement("h3"); heading.textContent = "Eye"; eye.appendChild(heading);
+      ["eye", "eyeOnly", "eyeCode"].forEach(function (k) { eye.appendChild(makeField(k)); setVal(k, values[k]); });
+      eye.hidden = false;
+    }
     /* the URL's world: ?seed / ?pop / ?depth, ?cfg (JSON; one that is not
      * goes to oc_init as it is, so it says why), ?e1=1 under it. The setup
      * goes to oc_init as it is (importWorld), and into the sheet only once

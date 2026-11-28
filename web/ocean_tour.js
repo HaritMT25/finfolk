@@ -131,10 +131,10 @@
                    "<b>Start fresh</b> (new fish), and <b>Replay from start</b> (drops live tweaks, keeps waiting edits). " +
                    "Under <b>Open &amp; save</b>, <b>Open a file…</b> stages a setup as the next recipe, or reopens a saved world after asking.";
           } },
-        { drawer: true, tab: "depth", scroll: "#f_kBuoy", place: h.drawerSides, title: "Your own settings",
+        { drawer: true, tab: "ocean", scroll: "#f_kBuoy", place: h.drawerSides, title: "Your own settings",
           target: function () { return h.rectOf("#f_kBuoy"); },
           body: function () {
-            return "Change anything by hand: the depth physics here, waves, light and currents under Water. " +
+            return "Change anything by hand: buoyancy, depth costs, waves, light and currents here under Water. " +
                    (h.touch() ? "Tap" : "Hover over") + " a setting's name to see what it does. Changes wait for " +
                    "<b>Start</b>, at the bottom; settings marked <i>live</i> apply at once.";
           } },

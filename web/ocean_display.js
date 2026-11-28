@@ -163,6 +163,24 @@
   })();
   }
   function wireClarity() {
+  ports.el("viewclarity").addEventListener("click", function () {
+    ports.layers.setDrawer(false);
+    ports.layers.setPop("view", ports.el("viewmenubtn"));
+    ports.el("clarity").focus();
+  });
+  var back = document.createElement("button");
+  back.type = "button"; back.className = "linkbtn"; back.id = "claritysetup";
+  back.textContent = "Setup › Water › Underwater light";
+  back.addEventListener("click", function () {
+    ports.layers.setPop(null); ports.layers.setDrawer(true); ports.setSheetTab("ocean");
+    ports.el("f_lightEnabled").scrollIntoView({ block: "center" });
+    ports.el("o_lightEnabled").focus();
+  });
+  var backLine = document.createElement("span");
+  backLine.className = "d"; backLine.appendChild(back);
+  var clarityControls = ports.el("clarityval").parentElement;
+  var clarityRow = clarityControls && clarityControls.parentElement;
+  if (clarityRow) clarityRow.appendChild(backLine);
   ports.el("clarity").addEventListener("input", function () {
     clarity = Math.max(0, Math.min(1, (+this.value || 0) / 100));
     ports.store("evo_boids.ocean.clarity", String(clarity));
