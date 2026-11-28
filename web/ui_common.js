@@ -118,6 +118,7 @@
     function reveal(b) {
       if (overflow() <= 1 || !b.getBoundingClientRect || !list.getBoundingClientRect) return;
       var lr = list.getBoundingClientRect(), br = b.getBoundingClientRect();
+      if (!br.width && !br.height) return;   /* a detached or hidden tab: no box to show */
       if (br.width >= lr.width) { list.scrollLeft += br.left - lr.left; return; }   /* wider than the strip: its start, always */
       var pad = Math.min(28, (lr.width - br.width) / 2);   /* clear of the fade, as far as both sides fit (else calls would see-saw) */
       if (br.left < lr.left + pad) list.scrollLeft -= lr.left + pad - br.left;

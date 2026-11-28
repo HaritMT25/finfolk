@@ -272,10 +272,10 @@ section("tabs(): a strip wider than its drawer (a mouse's wheel, the selected ta
   const list = D.make("nav", "wide"), widths = { a: 60, b: 60, c: 80, d: 140, e: 60 }, ids = Object.keys(widths), btn = {}, off = {};
   list.setAttribute("role", "tablist");
   let total = 0; for (const id of ids) { off[id] = total; total += widths[id]; }
-  let sl = 0, cw = 100, cur = "a";
+  let sl = 0, cw = 100, cur = "a", gone = false;   /* gone: the strip display:none (no layout: every width 0) */
   const clamp = (v) => Math.max(0, Math.min(total - cw, v));
-  Object.defineProperty(list, "scrollWidth", { get: () => total });
-  Object.defineProperty(list, "clientWidth", { get: () => cw, set: (v) => { cw = v; sl = clamp(sl); } });
+  Object.defineProperty(list, "scrollWidth", { get: () => (gone ? 0 : total) });
+  Object.defineProperty(list, "clientWidth", { get: () => (gone ? 0 : cw), set: (v) => { cw = v; sl = clamp(sl); } });
   Object.defineProperty(list, "scrollLeft", { get: () => sl, set: (v) => { const n = clamp(v); if (n !== sl) { sl = n; list.dispatchEvent(new D.Ev("scroll")); } } });
   list.getBoundingClientRect = () => ({ left: 0, right: cw, width: cw, top: 0, bottom: 30, height: 30 });
   const T = U.tabs(list, { ids: () => ids, current: () => cur, button: (id) => btn[id] || null, select: (id) => { cur = id; T.mark(id); } });
@@ -311,13 +311,28 @@ section("tabs(): a strip wider than its drawer (a mouse's wheel, the selected ta
   ok(!whole("b"), "(the drawer narrows: b now cut at the right)", { sl, at: at("b") });
   resize();
   ok(whole("b") && fades() === "LR", "a window resize shows the selected tab again (the Ocean's sheet becoming a 400 px drawer)", { sl, at: at("b"), fades: fades() });
+  const s0 = sl, cur0 = cur;
+  cur = "removed"; resize();
+  const sGone = sl; cur = cur0;
+  gone = true; resize();
+  const fGone = fades(); gone = false;
+  const bHidden = btn.e.getBoundingClientRect; btn.e.getBoundingClientRect = () => ({ left: 0, right: 0, width: 0, height: 0, top: 0, bottom: 0 });
+  cur = "e"; resize(); const sHidden = sl; cur = cur0; btn.e.getBoundingClientRect = bHidden;
+  ok(sGone === s0 && fGone === "--" && sHidden === s0 && D.errors.length === 0,
+     "a resize with the current tab removed, with the strip hidden (display:none), or with a tab that has no box: nothing moves, nothing throws",
+     { s0, sGone, fGone, sHidden });
+  resize();
   list.clientWidth = 1000;
   resize();
   ev = wheel({ deltaY: 100 });
   ok(sl === 0 && fades() === "--" && !ev.defaultPrevented, "a strip that fits: no fades, and the wheel is the page's", { sl, fades: fades() });
-  const css = fs.readFileSync(path.join(WEB, "ui_common.css"), "utf8"), iFade = css.indexOf(".ui-tablist.ui-more-l.ui-more-r {");
-  const iFocus = css.search(/\.ui-tablist\.ui-more-l:focus-within,\s*\.ui-tablist\.ui-more-r:focus-within\s*\{[^}]*-webkit-mask-image:\s*none;[^}]*\bmask-image:\s*none/);
-  ok(iFade >= 0 && iFocus > iFade, "ui_common.css: no fade while the keyboard is in the strip (after the fade rules, equal or higher specificity)", { iFade, iFocus });
+  const css = fs.readFileSync(path.join(WEB, "ui_common.css"), "utf8");
+  const iFade = Math.max(...[".ui-tablist.ui-more-r {", ".ui-tablist.ui-more-l {", ".ui-tablist.ui-more-l.ui-more-r {"].map((s) => css.indexOf(s)));
+  const mF = /\.ui-tablist\.ui-more-l:has\(:focus-visible\),\s*\.ui-tablist\.ui-more-r:has\(:focus-visible\)\s*\{([^}]*)\}/.exec(css);
+  const body = mF ? mF[1] : "";
+  ok(iFade >= 0 && mF && mF.index > iFade && /(^|[;\s])-webkit-mask-image:\s*none/.test(body) && /(^|[;\s])mask-image:\s*none/.test(body),
+     "ui_common.css: no fade under a keyboard's ring (:has(:focus-visible), not :focus-within, which a mouse's press also sets); after all three fade rules, equal or higher specificity",
+     { iFade, at: mF && mF.index });
   ok(D.errors.length === 0, "no listener threw", D.errors.slice(0, 2));
 }
 
