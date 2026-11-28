@@ -104,6 +104,34 @@
    */
   function tabs(list, o) {
     if (list.classList) list.classList.add("ui-tablist");
+    /* A strip wider than its drawer (a narrow window, long labels, the tabs' markers) must still reach every tab with a
+     * mouse: a vertical wheel scrolls it sideways, the selected tab is kept in view, and fades at its edges say there is
+     * more (.ui-more-l / .ui-more-r on the list, ui_common.css). A strip that fits is untouched. */
+    function overflow() { return (list.scrollWidth || 0) - (list.clientWidth || 0); }
+    function edges() {
+      if (!list.classList) return;
+      var max = overflow(), x = list.scrollLeft || 0;
+      list.classList.toggle("ui-more-l", max > 1 && x > 1);
+      list.classList.toggle("ui-more-r", max > 1 && x < max - 1);
+    }
+    /** @param {HTMLElement} b */
+    function reveal(b) {
+      if (overflow() <= 1 || !b.getBoundingClientRect || !list.getBoundingClientRect) return;
+      var lr = list.getBoundingClientRect(), br = b.getBoundingClientRect(), pad = 28;   /* clear of the fade */
+      if (br.left < lr.left + pad) list.scrollLeft -= lr.left + pad - br.left;
+      else if (br.right > lr.right - pad) list.scrollLeft += br.right - (lr.right - pad);
+    }
+    if (list.addEventListener) {
+      list.addEventListener("wheel", function (e) {
+        var max = overflow();
+        if (max <= 1 || e.ctrlKey || Math.abs(e.deltaX) >= Math.abs(e.deltaY)) return;   /* it fits; a zoom; already sideways */
+        var before = list.scrollLeft;
+        list.scrollLeft = before + e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? list.clientWidth : 1);
+        if (list.scrollLeft !== before) e.preventDefault();   /* at an end, the wheel goes back to the page */
+      }, { passive: false });
+      list.addEventListener("scroll", edges, { passive: true });
+    }
+    if (typeof window !== "undefined" && window.addEventListener) window.addEventListener("resize", edges);
     /** @param {string} id */
     function mark(id) {
       o.ids().forEach(function (t) {
@@ -111,7 +139,9 @@
         if (!b) return;
         b.setAttribute("aria-selected", t === id ? "true" : "false");
         b.tabIndex = t === id ? 0 : -1;
+        if (t === id) reveal(b);
       });
+      edges();
     }
     /** @param {HTMLElement} b @param {string} id */
     function bind(b, id) {
