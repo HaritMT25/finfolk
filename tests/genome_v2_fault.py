@@ -53,12 +53,14 @@ MUTANTS = [
  ('conversion_state','src/core/genome_v2_conversion.hpp','creature.nnet = std::move(net);','creature.nnet = std::move(net); creature.lineageId = 0;','tests','conversion state and lineage'),
  ('bias_reach_oob','src/ocean/ocean_world.hpp','src < NUM_SENSES + MAX_INTERNAL_NEURONS && reach[src - NUM_SENSES]','reach[src - NUM_SENSES]','reach',"runtime error: index 12 out of bounds for type 'bool [12]'"),
  ('header_trust','web/ocean_handoff.js','if (a.policy !== e.policy) return "its brain policy differs from its header";','if (false) return "its brain policy differs from its header";','header','header trust'),
- ('header_duplicate','web/ocean_handoff.js','if (policyKeys.indexOf(r.key) >= 0 &&','if (false && policyKeys.indexOf(r.key) >= 0 &&','header','header duplicate'),
- ('policy_assign_then_validate','src/ocean/ocean_config.hpp','SimConfig& sc = nextSim;','SimConfig& sc = simConfig;','ocean_policy','policy refusal preserves all config bytes'),
+ ('header_duplicate','web/ocean_handoff.js','parsedHeader.repeats.forEach(function (r) {','parsedHeader.repeats.forEach(function (r) { return;','header','header duplicate'),
+ # The inner reader now owns refusal rollback. These outer-alias mutants
+ # target lost ACCEPTED updates when a stale staged copy is published.
+ ('policy_assign_then_validate','src/ocean/ocean_config.hpp','SimConfig& sc = nextSim;','SimConfig& sc = simConfig;','ocean_policy','accepted policy update publishes sim config'),
  ('policy_input_only_staging','src/ocean/ocean_config.hpp',
   'SimConfig& sc = nextSim;\n    OceanConfig& oc = nextOcean;',
   'const auto* config = root.find("config");\n    const bool policyInput = config && (config->find("genomeVersion") || config->find("biasGenes") || config->find("hiddenNeurons") || config->find("brainEvalVersion"));\n    SimConfig& sc = policyInput ? nextSim : simConfig;\n    OceanConfig& oc = policyInput ? nextOcean : oceanConfig;',
-  'ocean_policy','policy refusal preserves all config bytes'),
+  'ocean_policy','accepted legacy update publishes both configs'),
 ]
 
 def main():
@@ -144,10 +146,6 @@ int main() {
         expected_count=1
         if count!=expected_count:raise SystemExit(f'{name}: anchor count {count}, wanted {expected_count}')
         source=source.replace(old,new)
-        if name=='policy_input_only_staging':
-            commit='    simConfig = nextSim;\n    oceanConfig = nextOcean;'
-            if source.count(commit)!=1: raise SystemExit(name+': publication anchor mismatch')
-            source=source.replace(commit,'    if (policyInput) {\n        simConfig = nextSim;\n        oceanConfig = nextOcean;\n    }')
         path.write_text(source)
         check(name,tree,target,True,match)
         shutil.rmtree(tree)

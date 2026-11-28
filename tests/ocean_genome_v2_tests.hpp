@@ -20,7 +20,6 @@ inline void testGenomeV2() {
         const auto dump = savedSim.dump();
         std::vector<const char*> refusals = {
             R"({"weightMutationMode":"bogus","targetFood":321,"waveSpeed":9})",
-            R"({"targetFood":321,"waveSpeed":9,"deepCurrent":{}})",
             R"({"genomeVersion":12,"targetFood":321,"waveSpeed":9})",
             R"({"genomeVersion":1,"genomeVersion":1})",
             R"({"hiddenNeurons":12,"hiddenNeurons":12})",
@@ -29,15 +28,13 @@ inline void testGenomeV2() {
             R"({"hiddenNeurons":24})", R"({"biasGenes":1})",
             R"({"genomeVersion":2,"brainEvalVersion":1})",
             R"({"genomeVersion":2,"brainEvalVersion":2,"weightMutationMode":"invalid"})",
-            R"({"genomeVersion":2,"brainEvalVersion":2,"weightMutationMode":"saturating","weightMutationMode":"saturating"})",
-            R"({"genomeVersion":2,"brainEvalVersion":2,"weightMutationMode":"saturating","waveSpeed":9,"deepCurrent":{}})"
+            R"({"genomeVersion":2,"brainEvalVersion":2,"weightMutationMode":"saturating","weightMutationMode":"saturating"})"
         };
         if (startV2) {
             for (const char* bad : {
                 R"({"weightMutationMode":"legacy","targetFood":321})",
                 R"({"genomeMaxLength":81})",
                 R"({"mutationMultiplier":1e100,"targetFood":321})",
-                R"({"targetFood":321,"waveSpeed":9,"deepCurrent":{}})"
             }) refusals.push_back(bad);
         }
         for (const char* bad : refusals) {
@@ -49,6 +46,20 @@ inline void testGenomeV2() {
                          std::memcmp(&savedOcean, oceanBytes.data(), sizeof savedOcean) == 0,
                      "policy refusal preserves all config bytes: %s", bad);
         }
+    }
+    // Outer staging must publish accepted updates, including legacy-only input.
+    // A direct alias followed by unconditional assignment of the stale staged
+    // copy discards the parsed SimConfig even though the reader succeeds.
+    for (bool policyInput : {true, false}) {
+        SimConfig sim; OceanConfig ocean; std::string why;
+        const char* text = policyInput
+            ? R"({"genomeVersion":2,"brainEvalVersion":2,"weightMutationMode":"saturating","targetFood":321,"waveSpeed":9})"
+            : R"({"targetFood":321,"waveSpeed":9})";
+        t.expect(readOceanJson(text, sim, ocean, why), "accepted staging fixture");
+        t.expect(sim.targetFood == 321 && ocean.waveSpeed == 9 &&
+                 sim.genomeVersion == (policyInput ? 2 : 1),
+                 policyInput ? "accepted policy update publishes sim config"
+                             : "accepted legacy update publishes both configs");
     }
     const char* policy=R"({"genomeVersion":2,"brainEvalVersion":2,"biasGenes":true,"weightMutationMode":"saturating","minPopulation":4,"maxPopulation":32})";
     SimConfig sc; OceanConfig oc; std::string error;

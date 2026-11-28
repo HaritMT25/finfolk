@@ -144,7 +144,7 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
     }
     const bool economyMatters = (o.assay != "frozen-newborn");
 
-    SimConfig& cfg = world.cfg;
+    SimConfig cfg = world.cfg;
     const bool xBrain = cfg.predatorBrain;
     std::vector<Predator> pool;
     SimConfig yc{};
@@ -162,7 +162,10 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
                 return false;
             }
         } else if (checkpoint::v3::integer(donorVersion, 2, 2)) {
-            checkpoint::readConfig(y, yc);
+            if (!checkpoint::readConfig(y, yc, error)) {
+                error = "predator source formats 1/2 require legacy weight mutation";
+                return false;
+            }
             if (yc.weightMutationMode != WeightMutationMode::Legacy || yc.genomeVersion != 1 ||
                 yc.biasGenes || yc.hiddenNeurons != 12 || yc.brainEvalVersion != 1) {
                 error = "predator source formats 1/2 require legacy weight mutation";
@@ -300,6 +303,8 @@ inline bool apply(World& world, const Options& o, const std::string& yText,
     }
     if (!fromScripted)
         if (const char* why = predatorBrainConfigError(cfg)) { error = std::string("arena config: ") + why; return false; }
+
+    world.cfg = cfg;
 
     // 3. the predators. Fresh ids above every id and lineage label in X and Y.
     unsigned long long firstId = xBrain ? world.nextPredatorId_ : 1ull;

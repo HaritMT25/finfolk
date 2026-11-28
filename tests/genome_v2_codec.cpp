@@ -5,11 +5,19 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <limits>
+#ifndef __EMSCRIPTEN__
+#include <csignal>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include "core/weight_log.hpp"
 #include "core/portable_math.hpp"
 #define CHECK(x, name) do { if (!(x)) { std::fprintf(stderr, "FAIL %s line %d\n", name, __LINE__); return 1; } } while (0)
 int main() {
     using namespace logweight;
+
     for (unsigned r = 0; r < 1024; ++r) {
         const float fraction = float(r) * 0x1p-10f;
         const float argument = fraction * 0x1.62e43p-1f;
@@ -41,6 +49,26 @@ int main() {
         CHECK(word(store(code)) == code, "bit preserving storage");
     }
     CHECK(accepted == 51203 && rejected == 14333, "exhaustive counts");
+#ifndef __EMSCRIPTEN__
+    // Isolate fatal precondition checks; demand the trap signal, not any failure.
+    for (int guard = 0; guard < 6; ++guard) {
+        const pid_t child = fork();
+        CHECK(child >= 0, "codec death-test fork");
+        if (child == 0) {
+            const rlimit noCore{0, 0}; setrlimit(RLIMIT_CORE, &noCore);
+            if (guard == 0) { volatile float value = decodeValid(0x8000); (void)value; }
+            if (guard == 1) { volatile auto value = addMagnitude(25602, 0); (void)value; }
+            if (guard == 2) { volatile auto value = quantize(std::numeric_limits<double>::quiet_NaN()); (void)value; }
+            if (guard == 3) { volatile auto value = quantize(513.0); (void)value; }
+            if (guard == 4) { volatile auto value = quantize(-513.0); (void)value; }
+            if (guard == 5) { volatile auto value = quantize(std::numeric_limits<double>::infinity()); (void)value; }
+            _exit(0);
+        }
+        int status = 0;
+        CHECK(waitpid(child, &status, 0) == child, "codec death-test wait");
+        CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGILL, "codec invalid input traps");
+    }
+#endif
     // A monotone sweep over sorted legacy magnitudes is independent of the
     // codec's binary search. Distances are exact binary64 differences.
     unsigned nearest = 0;

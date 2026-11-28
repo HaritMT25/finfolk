@@ -9,7 +9,6 @@
 #include "sensors_actions.hpp"
 #include "portable_math.hpp"
 #include "random.hpp"
-#include <cassert>
 #include <cstdlib>
 #include "weight_log.hpp"
 
@@ -455,7 +454,7 @@ inline bool buildNeuralNet(const Genome& genome, NeuralNet& nnet) {
     static_assert(NUM_SENSES + MAX_INTERNAL_NEURONS <= (1 << NeuralNet::FlatConn::SRC_BITS),
                   "source index space no longer fits in FlatConn::srcSink");
     static_assert(NUM_ACTIONS + MAX_INTERNAL_NEURONS
-                      <= (1 << (16 - NeuralNet::FlatConn::SRC_BITS)),
+                      <= (1 << (15 - NeuralNet::FlatConn::SRC_BITS)),
                   "sink index space no longer fits in FlatConn::srcSink");
     constexpr int NUM_SINKS = NUM_ACTIONS + MAX_INTERNAL_NEURONS;
 

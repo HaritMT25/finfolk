@@ -202,7 +202,9 @@ inline bool configIntegerKey(const std::string& key) {
     for (const char* k : keys) if (key == k) return true;
     return false;
 }
-inline bool rawBrainConfigValid(const jsonm::Value& o, const SimConfig& c) {
+inline bool rawBrainConfigValid(const jsonm::Value& o, const SimConfig& c, std::string& error) {
+    // Preserve existing schema-policy diagnostics; ordinary raw fields name the failure.
+    auto schemaFailure = [&]() { error = "genomeVersion must be 1 or 2"; return false; };
     using T = jsonm::Value::Type;
     const char* schemaKeys[] = {"genomeVersion", "biasGenes", "hiddenNeurons", "brainEvalVersion"};
     bool seen[4] = {};
@@ -210,16 +212,16 @@ inline bool rawBrainConfigValid(const jsonm::Value& o, const SimConfig& c) {
     for (const auto& kv : o.obj) {
         for (int i = 0; i < 4; ++i) {
             if (kv.first != schemaKeys[i]) continue;
-            if (seen[i]) return false;
+            if (seen[i]) return schemaFailure();
             seen[i] = true;
             const auto& v = kv.second;
             if (i == 1) {
-                if (v.type != T::Bool) return false;
+                if (v.type != T::Bool) return schemaFailure();
             } else {
                 if (v.type != T::Number || !std::isfinite(v.num) ||
                     std::trunc(v.num) != v.num ||
                     v.num < std::numeric_limits<int>::min() ||
-                    v.num > std::numeric_limits<int>::max()) return false;
+                    v.num > std::numeric_limits<int>::max()) return schemaFailure();
                 if (i == 0) v2 = v.num == 2;
             }
         }
@@ -232,18 +234,26 @@ inline bool rawBrainConfigValid(const jsonm::Value& o, const SimConfig& c) {
             if (v.type != T::Number || !std::isfinite(v.num) ||
                 std::trunc(v.num) != v.num ||
                 v.num < std::numeric_limits<int>::min() ||
-                v.num > std::numeric_limits<int>::max()) return false;
-            if (std::find(integers.begin(), integers.end(), kv.first) != integers.end()) return false;
+                v.num > std::numeric_limits<int>::max()) {
+                error = kv.first + " must be a whole number that fits an int";
+                return false;
+            }
+            if (std::find(integers.begin(), integers.end(), kv.first) != integers.end()) {
+                error = "repeated config member " + kv.first;
+                return false;
+            }
             integers.push_back(kv.first);
         }
     }
     return true;
 }
 
-inline void readConfig(const jsonm::Value& j, SimConfig& c) {
+[[nodiscard]] inline bool readConfig(const jsonm::Value& j, SimConfig& destination, std::string& error,
+                                     void (*prepare)(SimConfig&) = nullptr) {
+    SimConfig c = destination;
     const jsonm::Value* o = j.find("config");
-    if (!o || !o->isObject()) return;
-    if (!rawBrainConfigValid(*o, c)) { c.genomeVersion = 0; return; }
+    if (!o || !o->isObject()) return true;
+    if (!rawBrainConfigValid(*o, c, error)) return false;
     c.genomeVersion = o->intOr("genomeVersion", c.genomeVersion);
     c.biasGenes = o->boolOr("biasGenes", c.biasGenes);
     c.hiddenNeurons = o->intOr("hiddenNeurons", c.hiddenNeurons);
@@ -337,11 +347,17 @@ inline void readConfig(const jsonm::Value& j, SimConfig& c) {
         if (seenWeightMode ||
             kv.second.type != jsonm::Value::Type::String ||
             !parseWeightMutationMode(kv.second.str, c.weightMutationMode)) {
-            c.weightMutationMode = WeightMutationMode::Invalid;
-            return;
+            error = "weightMutationMode must be legacy or saturating";
+            return false;
         }
         seenWeightMode = true;
     }
+    // Frontends that historically normalize v1 inputs do so on this staged
+    // object before validation; direct readers validate the parsed copy as-is.
+    if (prepare) prepare(c);
+    if (const char* why = brainPolicyConfigError(c)) { error = why; return false; }
+    destination = c;
+    return true;
 }
 
 namespace v3 {
@@ -565,7 +581,10 @@ inline bool config(const Value& root, SimConfig& c, std::string& error, int revi
     }
 
     c = SimConfig{};
-    readConfig(root, c);
+    if (!readConfig(root, c, error)) {
+        error = "format 3: config: " + error;
+        return false;
+    }
     if (const char* why = predatorBrainConfigError(c)) {
         error = std::string("format 3: config: ") + why;
         return false;
@@ -1373,11 +1392,13 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
 
         // Old formats may explicitly spell their defaults, never a new schema.
         if (jcfg && jcfg->isObject()) {
-            if (!rawBrainConfigValid(*jcfg, SimConfig{})) {
+            if (!rawBrainConfigValid(*jcfg, SimConfig{}, error)) {
                 error = "formats 1/2 require valid v1 policy"; return false;
             }
             SimConfig defaults;
-            readConfig(j, defaults);
+            if (!readConfig(j, defaults, error)) {
+                error = "formats 1/2 require legacy brain policy"; return false;
+            }
             if (defaults.genomeVersion != 1 || defaults.biasGenes || defaults.hiddenNeurons != 12 ||
                 defaults.brainEvalVersion != 1 || defaults.weightMutationMode != WeightMutationMode::Legacy) {
                 error = "formats 1/2 require legacy brain policy"; return false;
@@ -1392,14 +1413,26 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
     if (width <= 0 || height <= 0) { error = "bad world dimensions"; return false; }
 
     // Config first: init() sizes the spatial grids from cfg.perceptionRadius.
-    world.cfg.weightMutationMode = WeightMutationMode::Legacy;
-    world.cfg.genomeVersion = 1;
-    world.cfg.biasGenes = false;
-    world.cfg.hiddenNeurons = 12;
-    world.cfg.brainEvalVersion = 1;
-    readConfig(j, world.cfg);
-    world.cfg.predatorBrain = brain;
-    if (const char* why = predatorBrainConfigError(world.cfg)) {
+    SimConfig nextCfg = world.cfg;
+    nextCfg.weightMutationMode = WeightMutationMode::Legacy;
+    nextCfg.genomeVersion = 1;
+    nextCfg.biasGenes = false;
+    nextCfg.hiddenNeurons = 12;
+    nextCfg.brainEvalVersion = 1;
+    // The incoming format determines the brain before policy validation.
+    // Brain-off writers omit these fields; stale Stage-C settings must not
+    // affect acceptance or the resumed config.
+    nextCfg.predatorBrain = brain;
+    if (!brain) {
+        const SimConfig defaults;
+        nextCfg.predatorMutation = defaults.predatorMutation;
+        nextCfg.predatorTurnRate = defaults.predatorTurnRate;
+        nextCfg.predatorMinSpeed = defaults.predatorMinSpeed;
+        nextCfg.predatorPrimer = defaults.predatorPrimer;
+        nextCfg.predatorFrozen = defaults.predatorFrozen;
+    }
+    if (!readConfig(j, nextCfg, error)) { error = "config: " + error; return false; }
+    if (const char* why = predatorBrainConfigError(nextCfg)) {
         error = std::string("config: ") + why;
         return false;
     }
@@ -1414,19 +1447,20 @@ inline bool deserialize(const std::string& text, World& world, std::string& erro
     // json_min parses the bare `nan` and `inf` tokens, so a plain `< 0.0f`
     // check would wave both straight through into rng.range — which then
     // returns NaN and turns every newborn body into NaN.
-    // (Validated here rather than in readConfig, which has no error channel and
-    // is also used for partial and older config schemas.)
-    if (!(world.cfg.bodyMutation >= 0.0f) || !std::isfinite(world.cfg.bodyMutation)) {
+    // (Validated here rather than in readConfig, which is also used for partial and older config schemas.)
+    if (!(nextCfg.bodyMutation >= 0.0f) || !std::isfinite(nextCfg.bodyMutation)) {
         error = "config 'bodyMutation' must be finite and >= 0";
         return false;
     }
     // Same rule, same reasons, for the predator trait mutation (v0.26.0): its
     // only legal writers (--predator-trait-mutation, evo_init) refuse negative
     // and non-finite values, and a NaN here would turn every bud's traits NaN.
-    if (!(world.cfg.predatorTraitMutation >= 0.0f) || !std::isfinite(world.cfg.predatorTraitMutation)) {
+    if (!(nextCfg.predatorTraitMutation >= 0.0f) || !std::isfinite(nextCfg.predatorTraitMutation)) {
         error = "config 'predatorTraitMutation' must be finite and >= 0";
         return false;
     }
+
+    world.cfg = nextCfg;
 
     // Build an empty world of the right geometry, then overwrite every piece of
     // state. init() draws from the rng (vortices, food patches), which is

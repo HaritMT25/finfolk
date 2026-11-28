@@ -30,7 +30,7 @@ base = subprocess.check_output(
     ['git', '-C', str(root), 'rev-parse', '--verify', sys.argv[3] + '^{commit}'],
     text=True).strip()
 # Count occurrences in the actual bytes, including strings shorter than 8 bytes.
-roots = [str(root), str(copy), '/home/harit']
+roots = [str(root), str(copy), str(Path.home())]
 print('Approved main commit:', base)
 print('Forbidden build roots:', roots)
 print('artifact\tbuild\tsha256\tworktree\tsecond-root\thost-home\tvirtual-home')

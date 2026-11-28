@@ -161,13 +161,14 @@ add_executable(checkpoint_v3_validation tests/checkpoint_v3_validation.cpp)
 target_link_libraries(checkpoint_v3_validation PRIVATE evo_core)
 add_test(NAME checkpoint_v3_validation COMMAND checkpoint_v3_validation)
 
-foreach(g2_target genome_v2_codec genome_v2_tests genome_v2_frontend)
+foreach(g2_target genome_v2_codec genome_v2_tests genome_v2_frontend genome_v2_resume_compat)
     add_executable(${g2_target} tests/${g2_target}.cpp)
     target_link_libraries(${g2_target} PRIVATE evo_core)
     add_test(NAME ${g2_target} COMMAND ${g2_target})
 endforeach()
 add_executable(genome_v2_convert tools/genome_v2_convert.cpp)
 target_link_libraries(genome_v2_convert PRIVATE evo_core)
+target_compile_definitions(genome_v2_convert PRIVATE EVO_VERSION="${PROJECT_VERSION}")
 
 # predator_smoke — a longer no-SFML integration run with predators ON, asserting
 # the run-level invariants (pop floor, finite positions, predation occurs,
@@ -202,6 +203,9 @@ if(SFML_FOUND AND EVO_NO_OPENMP AND NOT EVO_POOL_THREADS)
     # real engine; pins the child-id derivation the invasion scores rely on.
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME genome_v2_convert
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/genome_v2_convert.py
+                         $<TARGET_FILE:genome_v2_convert> $<TARGET_FILE:evo_boids>)
         add_test(NAME invasion_tooling
                  COMMAND bash ${CMAKE_SOURCE_DIR}/tests/invasion_tooling.sh
                          $<TARGET_FILE:evo_boids> ${CMAKE_CURRENT_BINARY_DIR}/invasion_tooling_work)
