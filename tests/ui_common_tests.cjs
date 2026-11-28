@@ -333,6 +333,9 @@ section("tabs(): a strip wider than its drawer (a mouse's wheel, the selected ta
   ok(iFade >= 0 && mF && mF.index > iFade && /(^|[;\s])-webkit-mask-image:\s*none/.test(body) && /(^|[;\s])mask-image:\s*none/.test(body),
      "ui_common.css: no fade under a keyboard's ring (:has(:focus-visible), not :focus-within, which a mouse's press also sets); after all three fade rules, equal or higher specificity",
      { iFade, at: mF && mF.index });
+  const fb = /@supports\s+not\s+selector\(\s*:has\(:focus-visible\)\s*\)\s*\{\s*\.ui-tablist\.ui-more-l:focus-within,\s*\.ui-tablist\.ui-more-r:focus-within\s*\{([^}]*)\}\s*\}/.exec(css);
+  ok(fb && fb.index > iFade && /(^|[;\s])-webkit-mask-image:\s*none/.test(fb[1]) && /(^|[;\s])mask-image:\s*none/.test(fb[1]),
+     "ui_common.css: a browser without :has() (Firefox 89-120, inside the documented floor) falls back to :focus-within", { at: fb && fb.index });
   ok(D.errors.length === 0, "no listener threw", D.errors.slice(0, 2));
 }
 

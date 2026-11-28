@@ -349,3 +349,7 @@ body:has(#viewpop:not([hidden])) #toasts, body.help-open #toasts { clip-path: in
 /* a keyboard's ring in the strip (:focus-visible; a mouse's press is not, though the browser may focus the tab): no fade over the
  * ring; the arrows keep the selected tab in view */
 .ui-tablist.ui-more-l:has(:focus-visible), .ui-tablist.ui-more-r:has(:focus-visible) { -webkit-mask-image: none; mask-image: none; }
+/* a browser without :has() (Firefox before 121): any focus in the strip, as before (a mouse's press may also drop the fade there) */
+@supports not selector(:has(:focus-visible)) {
+  .ui-tablist.ui-more-l:focus-within, .ui-tablist.ui-more-r:focus-within { -webkit-mask-image: none; mask-image: none; }
+}
