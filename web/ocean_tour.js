@@ -108,7 +108,7 @@
             return "Pause and change speed; while paused, the step button moves one step at a time. <b>Turbo</b> " +
                    "runs this same world many times faster without drawing it, and hands it back exactly. Then the " +
                    "flashlight, <b>View</b> (how the tank looks: the light, the water, the fish colours) and the " +
-                   "tank button, which fits the whole tank back on screen. Nothing here replaces your world.";
+                   "corners, which fit the whole tank back on screen. Nothing here replaces your world.";
           } },
         { drawer: false, title: "Dashboards",
           target: function () { return h.rectOf("#dashbtn"); },

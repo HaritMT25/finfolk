@@ -1644,7 +1644,8 @@
     if (statOpen) renderStatPanel();
   }
   function renderStatPanel() {
-    var st = lastStats, p = el("statpanel");
+    var st = lastStats, p = el("statbody");   /* (the panel's numbers; a phone's world switch, #worlds-alt, stays under them) */
+    if (!p) return;
     if (!st || !Module) { p.textContent = "Starting…"; return; }
     var mode = threaded ? "threaded × " + threadCount() : "single-threaded";
     var cap = userCap > 0 && autoCap > 0 ? Math.min(userCap, autoCap) : (userCap || autoCap);
@@ -1900,6 +1901,20 @@
     b.querySelector("use").setAttribute("href", paused ? "#i-play" : "#i-pause");
     b.setAttribute("aria-label", paused ? "play" : "pause");
     b.title = (paused ? "Play" : "Pause") + " (Space)";
+    paintRunState();
+  }
+  /* The run's state in the readout (#runstate), the Ocean's (web/ocean.js paintRunState): Live or Paused (this page),
+   * or Turbo starting, running or stopping (the worker). Display only: setPaused and updateLocks paint it. */
+  var RUNSTATE = { live: ["Live", "The world is running"], paused: ["Paused", "Paused: Space or ▶ runs it"],
+                   entering: ["Starting Turbo", "Turbo is taking the world"], turbo: ["Turbo", "Turbo is running the world without drawing it"],
+                   exiting: ["Stopping Turbo", "Turbo is handing the world back"] };
+  function paintRunState() {
+    var s = turboState === "live" ? (paused ? "paused" : "live") : turboState, r = el("runstate");
+    if (!r || !RUNSTATE[s] || r.dataset.s === s) return;
+    r.dataset.s = s;
+    r.title = RUNSTATE[s][1];
+    var w = r.querySelector(".rs-word");
+    if (w) w.textContent = RUNSTATE[s][0];
   }
   function setSpeed(n) {
     simSpeed = Math.max(1, Math.min(50, n));
@@ -1992,6 +2007,7 @@
     el("turboexit").disabled = turboState !== "turbo";
     el("turboexit").textContent = turboState === "exiting" ? "Syncing back…" : turboState === "entering" ? "Starting…" : "Stop Turbo and watch";
     if (turboState !== "live") paintTurbo();
+    paintRunState();
   }
   function paintTurbo() {
     var t = turboStats;
@@ -2525,6 +2541,7 @@
   askBtn("randombtn", randomize);
   askBtn("randombig", randomize);
   btn("guidebtn", function () { if (window.EvoGuide) EvoGuide.start(); });
+  if (el("to3dmenu") && el("to3d")) el("to3dmenu").href = el("to3d").href;   /* a phone's switch, in the live numbers: the deploy build renames the Ocean's page in #to3d */
   btn("followbtn", toggleFollow);
   btn("viewbtn", function () { if (view3d) scene.resetView(true); });
   el("view3d").addEventListener("change", fenced(function () { setView(this.checked, true); this.blur(); }));

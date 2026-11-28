@@ -5,7 +5,7 @@
 // selection checks (--plan) and the comparison gate (--compare) need no browser: tests/ui_parity_harness_tests.mjs runs them in CI.
 //
 //   node tests/ui_parity_browser.mjs --base http://localhost:8123 --out DIR [--clean] [--layout source|site] [--sets S0,S2]
-//        [--cases s0_shell,...] [--worlds classic,ocean] [--expect check|record] [--name WHO] [--smoke] [--headed]
+//        [--cases s0_shell,...] [--worlds classic,ocean] [--expect check|record] [--hide #id,.class,...] [--name WHO] [--smoke] [--headed]
 //   node tests/ui_parity_browser.mjs --plan [the same selection]          what a run would take (no browser), or why it is refused
 //   node tests/ui_parity_browser.mjs --list                               the cases
 //   node tests/ui_parity_browser.mjs --compare BEFORE_DIR AFTER_DIR [--report [--archival]] [--cases-file F] [--sets ..] [--cases ..]
@@ -26,6 +26,12 @@
 // --expect: check (the default): a shot whose state is not its case's "expect" fails the run. record: it is kept in the
 //          manifest (the capture's "unmet") and the run goes on: main's run before a PR that brings the behaviour. --compare
 //          lists BEFORE's unmet expectations; AFTER may miss only what BEFORE missed too, the same way (else INVALID).
+// --hide:  elements kept out of every case's pictures (simple #id or .class selectors, comma separated; anything else exit 2):
+//          opacity 0 from the page's load on, so they keep their place, their focus and their clicks and nothing else
+//          moves; recorded in the manifest. A pull request that restyles some of the page shows that the rest did not change:
+//          its run and main's, both with the same --hide (--compare refuses two runs that hid different elements, INVALID).
+//          A masked comparison proves only the rest of the page, so --compare gates on two --hide runs only with --allow-hide
+//          (without it, INVALID; --report lists them as usual). The selectors' order does not matter.
 // The run writes DIR/manifest.json (kept current after every case): the harness's and the fixture's sha256, the selection,
 //          every capture it was to take, and every one it took (sha256, size, case, set, world, shot, the fixture's difference
 //          policy for it); "complete" only once every run passed and every capture was taken. Exit 1 on any failed run.
@@ -132,7 +138,7 @@ const FORMAT = "ui-parity-run", FORMAT_VERSION = 1;
 
 /* ---------------- arguments: every flag known, a value where one is wanted ---------------- */
 const FLAGS = { base: 1, out: 1, layout: 1, sets: 1, cases: 1, worlds: 1, name: 1, "cases-file": 1,
-                expect: 1, smoke: 0, headed: 0, list: 0, plan: 0, clean: 0, report: 0, archival: 0, compare: 2 };
+                expect: 1, hide: 1, smoke: 0, headed: 0, list: 0, plan: 0, clean: 0, report: 0, archival: 0, compare: 2, "allow-hide": 0 };
 const DEFAULT_CASES = path.join(HERE, "fixtures", "ui_parity_cases.json");
 const SHA_RE = /^[0-9a-f]{64}$/;
 const READY_FIRST = process.env.UI_PARITY_READY_FIRST === "1";
@@ -156,6 +162,18 @@ function parseArgs(argv) {
 }
 const ARGS = parseArgs(process.argv.slice(2));
 const listOf = (v) => (v === undefined ? null : String(v).split(",").map((x) => x.trim()).filter(Boolean));
+/* --hide's selectors: null (none), or a list of simple #id / .class selectors; {bad} otherwise. A manifest's hide is read the same way */
+const HIDE_RE = /^[#.][A-Za-z_][\w-]*$/;
+function hideOf(v) {
+  if (v === undefined || v === null) return { list: null };
+  const l = Array.isArray(v) ? v : listOf(v);
+  if (!l.length) return { bad: "--hide names no element" };
+  const off = l.filter((s) => typeof s !== "string" || !HIDE_RE.test(s));
+  if (off.length) return { bad: "--hide takes simple #id or .class selectors, comma separated, not " + off.map((s) => JSON.stringify(s)).join(", ") };
+  if (new Set(l).size !== l.length) return { bad: "--hide names an element twice" };
+  return { list: l.slice() };
+}
+const hideText = (l) => (l ? l.join(", ") : "none");
 const sha256 = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 
 /* ---------------- PNG (8-bit RGB / RGBA, not interlaced: what the browser writes) ---------------- */
@@ -484,9 +502,23 @@ function compareMain(o) {
   const ra = readRun(A, "BEFORE " + A, K), rb = readRun(B, "AFTER " + B, K), problems = ra.problems.concat(rb.problems);
   let files = [];
   const unmet = [];
+  let hidden = null;
   if (ra.m && rb.m) {
     if (archival && ra.m.harness !== rb.m.harness)
       problems.push("the two runs were taken by different harness files (sha256 " + String(ra.m.harness).slice(0, 12) + " vs " + String(rb.m.harness).slice(0, 12) + "): a record compares two runs of one");
+    /* --hide: both runs kept the same elements out of their pictures (else the comparison says nothing of either) */
+    const ha = hideOf(ra.m.hide), hb = hideOf(rb.m.hide);
+    for (const [h, side, m] of [[ha, "BEFORE", ra.m], [hb, "AFTER", rb.m]])
+      if (h.bad) problems.push(side + ": its manifest's hide " + JSON.stringify(m.hide) + " is not one a run records (" + h.bad + ")");
+    if (!ha.bad && !hb.bad) {
+      const sorted = (l) => (l ? l.slice().sort() : l);   /* the same elements in another order are the same --hide */
+      if (hideText(sorted(ha.list)) !== hideText(sorted(hb.list)))
+        problems.push("the two runs hid different elements (BEFORE --hide " + hideText(ha.list) + ", AFTER --hide " + hideText(hb.list) + "): take both with the same --hide");
+      else hidden = ha.list;
+    }
+    /* a masked comparison proves only the visible rest: a gate takes it only when asked (--allow-hide); a --report lists it */
+    if (hidden && !report && !o["allow-hide"])
+      problems.push("both runs used --hide " + hideText(hidden) + ": a masked comparison proves only the rest of the page; pass --allow-hide to gate on it (or --report)");
     for (const f of planned) for (const [r, side] of [[ra, "BEFORE"], [rb, "AFTER"]])
       if (!r.m.captures[f]) problems.push(f + ": the comparison plans it, " + side + " did not take it (its selection: " + selText(r.m.selection) + "); narrow the comparison or take the run again");
     files = planned.filter((f) => ra.m.captures[f] && rb.m.captures[f]);
@@ -527,18 +559,21 @@ function compareMain(o) {
   for (const p of problems) console.log("  INVALID " + p);
   const counts = ["same", "within", "differs", "size"].map((v) => rows.filter((r) => r.verdict === v).length);
   console.log(verdict + ": " + (problems.length ? problems.length + " problems with the evidence; nothing compared" :
-              rows.length + " pictures: " + counts[0] + " identical, " + counts[1] + " within their policy, " + counts[2] + " beyond it, " + counts[3] + " of another size" +
+              rows.length + " pictures" + (hidden ? " (both runs with --hide " + hideText(hidden) + ")" : "") + ": " + counts[0] + " identical, " + counts[1] + " within their policy, " + counts[2] + " beyond it, " + counts[3] + " of another size" +
               (report ? " (--report: differences listed, not failed)" : "") + (archival ? " (--archival: runs of harness " + String(ra.m.harness).slice(0, 12) + ", a record, not a gate)" : "") +
               (unmet.length ? "; " + unmet.length + " expectations BEFORE did not meet" + (unmet.some((u) => u.side === "both") ? " (some neither run met)" : "") : "")));
   if (OUTD) fs.writeFileSync(path.join(OUTD, "compare.json"), JSON.stringify({ format: "ui-parity-compare", written, before: path.resolve(A), after: path.resolve(B),
     mode: report ? (archival ? "report-archival" : "report") : "check", harness: K.harnessSha, fixture: K.fixSha, casesFile: K.casesFile,
-    selection: { sets, cases: ids, worlds }, planned: planned.length, verdict, problems, unmet, expectModes: { before: ra.m && ra.m.expectMode, after: rb.m && rb.m.expectMode }, counts: { same: counts[0], within: counts[1], differs: counts[2], size: counts[3] }, files: rows }, null, 1));
+    selection: { sets, cases: ids, worlds }, hide: hidden, planned: planned.length, verdict, problems, unmet, expectModes: { before: ra.m && ra.m.expectMode, after: rb.m && rb.m.expectMode }, counts: { same: counts[0], within: counts[1], differs: counts[2], size: counts[3] }, files: rows }, null, 1));
   process.exit(verdict === "PASS" || verdict === "REPORT" ? 0 : 1);
 }
 
 /* ---------------- dispatch: compare, list, plan (no browser), then a run ---------------- */
 if (ARGS.compare) {
-  for (const k of Object.keys(ARGS)) if (["compare", "report", "archival", "cases-file", "sets", "cases", "worlds", "out", "clean"].indexOf(k) < 0) usage("--" + k + " is not a --compare flag");
+  for (const k of Object.keys(ARGS)) if (["compare", "report", "archival", "cases-file", "sets", "cases", "worlds", "out", "clean", "allow-hide"].indexOf(k) < 0) usage("--" + k + " is not a --compare flag");
+}
+if (ARGS["allow-hide"] && !ARGS.compare) usage("--allow-hide goes with --compare");
+if (ARGS.compare) {
   compareMain(ARGS);
 }
 if (ARGS.report) usage("--report goes with --compare");
@@ -554,10 +589,14 @@ const PLAN = makePlan(FIX, ARGS);
 if (PLAN.bad.length) usage(PLAN.bad.join("\n  "));
 const EXPECT_MODE = ARGS.expect === undefined ? "check" : String(ARGS.expect);
 if (EXPECT_MODE !== "check" && EXPECT_MODE !== "record") usage("--expect is check (the default: a shot that does not meet its case's expect fails the run) or record (kept in the manifest: main's run before a PR that brings the behaviour)");
+const HIDE_SEL = hideOf(ARGS.hide);
+if (HIDE_SEL.bad) usage(HIDE_SEL.bad);
+const HIDE = HIDE_SEL.list;
 const EXPECTED = PLAN.runs.flatMap((r) => r.captures.map((x) => x.file));
 if (ARGS.plan) {
   for (const r of PLAN.runs) console.log("run   " + r.c.id + " on " + r.world + ": " + r.captures.length + " captures");
   for (const s of PLAN.smokes) console.log("smoke " + s.label + " " + s.route);
+  if (HIDE) console.log("hide  " + hideText(HIDE) + " (opacity 0 in every case's pictures)");
   console.log("plan: " + PLAN.runs.length + " case runs, " + EXPECTED.length + " captures, " + PLAN.smokes.length + " smoke runs");
   process.exit(0);
 }
@@ -970,6 +1009,8 @@ async function runCase(run, onCapture, onExtra) {
     L.shots = rec.shots; L.tabs = []; L.captured = [];
     await L.ctx.addInitScript(INIT, { hold: true, clock: true, animT: DEF.animT, visualSeed: DEF.visualSeed });
     await L.page.goto(url, { waitUntil: "load", timeout: 120000 });
+    /* --hide: out of the pictures from here on, in their place (opacity 0: their layout, focus and clicks stay) */
+    if (HIDE) await L.page.addStyleTag({ content: HIDE.join(", ") + " { opacity: 0 !important; }" });
     rec.assets = await L.page.evaluate(() => Array.from(document.scripts).map((s) => s.getAttribute("src")).filter(Boolean));
     rec.world0 = await setupWorld(L, world);
     rec.renderer = await barrier(L);
@@ -1029,7 +1070,7 @@ async function smoke(s, onCapture) {
 const summary = { started: new Date().toISOString(), base: BASE, layout: LAYOUT, routes: ROUTES, defaults: DEF, cases: [], smoke: [] };
 const manifest = { format: FORMAT, version: FORMAT_VERSION, harness: sha256(fs.readFileSync(SELF)), fixture: FIX_SHA, fixtureFile: CASES_FILE,
                    base: BASE, layout: LAYOUT, selection: PLAN.selection, started: summary.started, finished: null, status: "running", complete: false,
-                   expectMode: EXPECT_MODE, barrierTiming: READY_FIRST ? "ready-first" : "as-it-comes", policy: DEF.compare, expected: EXPECTED.concat(PLAN.smokes.map((s) => "smoke__" + s.label + ".png")), captures: {}, extra: [], runs: [], smoke: [] };
+                   expectMode: EXPECT_MODE, hide: HIDE, barrierTiming: READY_FIRST ? "ready-first" : "as-it-comes", policy: DEF.compare, expected: EXPECTED.concat(PLAN.smokes.map((s) => "smoke__" + s.label + ".png")), captures: {}, extra: [], runs: [], smoke: [] };
 const save = () => {
   fs.writeFileSync(path.join(OUT, "summary.json"), JSON.stringify(summary, null, 1));
   fs.writeFileSync(path.join(OUT, "manifest.json"), JSON.stringify(manifest, null, 1));
@@ -1059,7 +1100,7 @@ finally {
   manifest.status = manifest.complete ? "complete" : threw ? "aborted: " + String(threw && threw.message || threw) : "failed: " + failed + " runs, " + missing.length + " captures missing";
   save();
   const md = ["# UI parity pictures", "", "Base " + BASE + " (" + LAYOUT + " layout), " + summary.started + ". Seed " + DEF.seed + ", " + DEF.founders +
-              " founders, " + DEF.viewport.join(" x ") + " at DPR " + DEF.dpr + ". From tests/ui_parity_browser.mjs; the state of each picture is in summary.json, " +
+              " founders, " + DEF.viewport.join(" x ") + " at DPR " + DEF.dpr + (HIDE ? ", --hide " + hideText(HIDE) : "") + ". From tests/ui_parity_browser.mjs; the state of each picture is in summary.json, " +
               "the run's evidence in manifest.json (" + manifest.status + ").", "",
               "| case | world | shot | file | tick | paused | focus | tabs (dash / setup) | speed |", "|---|---|---|---|---|---|---|---|---|"];
   for (const r of summary.cases) for (const s of r.shots) {

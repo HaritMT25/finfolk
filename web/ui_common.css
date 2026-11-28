@@ -64,3 +64,281 @@
   input.switch:focus-visible { outline-offset: -6px; }
   #fishcard a { display: inline-flex; align-items: center; min-height: 44px; padding: 0 6px; }
 }
+
+/* ---------- the bars: one system on both pages ----------
+ * Four places, one job each: top left what is happening (#readout), top centre which world (#worlds), top right the
+ * panels (#tools), the bottom time and view (#dock). Every bar is the same shell (dark and dense, a hairline rim, a
+ * light shadow); shade carries the hierarchy: resting (no fill, soft ink), engaged (a raised fill: an open panel, the current
+ * world, a tool that is on), primary (the one light disc: Pause / Play). Each colour has one meaning: lime is alive
+ * (the Live dot), ember is Turbo or a warning, yellow is the flashlight while it is on, blue is the Finfolk mark.
+ * Hints and tips are captions, not boxes. The reserved bands (--top-h, --dock-h) do not change, so nothing outside
+ * the bars moves: the dock's box keeps its band (the 3-D tank's framing measures it: web/ocean.js and renderer.js
+ * updateInsets) and draws its shell along the band's foot. Display only.
+ * The shell does not blur what is under it (--bar-glass: none; so its 92 %, the design's no-blur shell): a
+ * backdrop-filter makes each bar a compositor layer, and the panels drawn over them (the dashboards, the setup sheet's
+ * start bar) then lose their LCD (subpixel) text on Windows. The glass instead: --bar-bg at 0.82 and
+ * --bar-glass: blur(14px) saturate(1.15). */
+:root {
+  --bar-h: 48px; --bar-btn: 40px; --bar-pad: 4px; --bar-edge: 12px; --bar-gap: 12px;
+  --bar-bg: oklch(0.235 0.028 198 / 0.92);
+  --bar-glass: none;
+  --bar-rim: oklch(0.55 0.03 190 / 0.22);
+  --bar-shadow: 0 6px 20px oklch(0.08 0.03 210 / 0.32);
+  --bar-div: oklch(0.55 0.03 190 / 0.30);
+  --bar-ink: oklch(0.78 0.022 188);                                         /* resting */
+  --bar-primary: oklch(0.93 0.018 185); --bar-primary-ink: oklch(0.22 0.03 200);
+  --bar-mode: oklch(0.72 0.18 38 / 0.20); --bar-mode-ink: oklch(0.82 0.14 45); --bar-ember: oklch(0.72 0.18 38);
+  --bar-live: oklch(0.86 0.19 125);
+  --bar-light: oklch(0.93 0.12 95); --bar-light-soft: oklch(0.93 0.12 95 / 0.18);
+  --bar-mark: oklch(0.70 0.11 235);
+}
+@media (pointer: coarse) { :root { --bar-h: 52px; --bar-btn: 44px; --bar-edge: 10px; } }   /* 44 px to tap; 10 + 52 keeps the panels at 64 px clear */
+@media (max-width: 599px) { :root { --bar-edge: 10px; } }
+
+/* the shell (the dock's is its ::before, below); the coach mark has buttons, so it is a shell too. (A shell's glass,
+ * when --bar-glass has one, blurs the tank under it.) */
+#readout, #worlds, #tools, #dock::before, #coach {
+  background: var(--bar-bg);
+  -webkit-backdrop-filter: var(--bar-glass); backdrop-filter: var(--bar-glass);
+  border: 1px solid var(--bar-rim);
+  box-shadow: var(--bar-shadow);
+}
+
+/* the tiers of the bars' buttons (only here: the fish card's, the popovers' and the setup sheet's .icon-btn keep the
+ * pages' own rules). Resting: no fill, the soft ink; hover a faint fill; engaged a raised fill and the bright ink (an
+ * open panel, a pressed tool; the current world, below) */
+#topbar .icon-btn, #dock .icon-btn { width: var(--bar-btn); height: var(--bar-btn); color: var(--bar-ink); }
+#topbar .icon-btn svg.i, #dock .icon-btn svg.i { width: 20px; height: 20px; }
+#topbar .icon-btn:hover, #dock .icon-btn:hover { background: var(--surface-2); color: var(--ink); }
+#topbar .icon-btn[aria-expanded="true"], #dock .icon-btn[aria-expanded="true"], #dock .icon-btn[aria-pressed="true"] { background: var(--surface-3); color: var(--ink); }
+/* primary: the one light disc, Pause / Play */
+#dock #pausebtn { background: var(--bar-primary); color: var(--bar-primary-ink); }
+#dock #pausebtn:hover { background: oklch(0.98 0.01 185); color: var(--bar-primary-ink); }
+#dock #pausebtn svg.i { width: 18px; height: 18px; }
+/* mode: Turbo only (its button while it runs, Stop, the run-state pill) */
+#dock #turbobtn[aria-pressed="true"], #dock #turboexit { background: var(--bar-mode); color: var(--bar-mode-ink); }
+#dock #turbobtn[aria-pressed="true"]:hover, #dock #turboexit:hover { background: oklch(0.72 0.18 38 / 0.28); color: var(--bar-mode-ink); }
+/* light: the flashlight while it is on, the bars' one yellow */
+#dock #lightbtn[aria-pressed="true"] { background: var(--bar-light-soft); color: var(--bar-light); }
+
+/* ---------- each bar ---------- */
+/* the top bar: three columns, the switch centred while the readout fits beside it (else it sits just after the
+ * readout); where the screen is too narrow for all three, the readout gives way (clipped: its panel has the rest) */
+#topbar {
+  position: fixed; z-index: var(--z-hud);
+  top: calc(var(--bar-edge) + var(--safe-t)); left: var(--bar-edge); right: var(--bar-edge);
+  display: grid; grid-template-columns: minmax(max-content, 1fr) auto minmax(max-content, 1fr);
+  align-items: center; column-gap: var(--bar-gap);
+  pointer-events: none;
+  --tb-room: calc(100vw - 2 * var(--bar-edge));
+}
+#topbar > * { pointer-events: auto; }
+#readout {
+  grid-column: 1; justify-self: start;
+  display: flex; align-items: center; gap: 12px;
+  height: var(--bar-h); min-width: 0;
+  max-width: calc(var(--tb-room) - 2 * var(--bar-gap) - var(--worlds-w, 120px) - var(--tools-w, 140px));
+  padding: 0 8px 0 14px; border-radius: 999px;
+  font-size: 13px; color: var(--bar-ink); text-align: left;
+  white-space: nowrap; overflow: hidden;
+}
+#readout .mark { display: inline-flex; align-items: center; gap: 7px; flex: none; color: var(--ink); font-family: var(--mono); font-size: 13px; font-weight: 600; }
+#readout .mark svg { width: 20px; height: 20px; color: var(--bar-mark); }
+#readout .mark span { display: none; }
+#readout .sep { flex: none; width: 1px; height: 20px; background: var(--bar-div); }
+#readout b { color: var(--ink); font-weight: 600; }   /* the values; their units keep the resting ink */
+#readout .warn { color: var(--bar-mode-ink); }        /* a low frame rate */
+@media (min-width: 600px) { #readout .mark span { display: inline; } }
+@media (max-width: 479px) { #readout .ro-rate { display: none; } }   /* a phone: the frame rate stays in the live numbers' panel */
+/* the run's state: Live, Paused, Turbo (starting, running, stopping); a phone shows its dot only */
+.runstate { display: inline-flex; align-items: center; gap: 6px; flex: none; height: 28px; padding: 0 11px 0 9px; border-radius: 999px;
+            background: var(--surface-2); color: var(--ink-2); font-size: 12px; font-weight: 600; }
+.runstate::before { content: ""; flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--bar-live); }
+.runstate[data-s="paused"]::before { background: var(--ink-3); border-radius: 1px; }
+.runstate[data-s="entering"], .runstate[data-s="turbo"], .runstate[data-s="exiting"] { background: var(--bar-mode); color: var(--bar-mode-ink); }
+.runstate[data-s="entering"]::before, .runstate[data-s="turbo"]::before, .runstate[data-s="exiting"]::before { background: var(--bar-ember); }
+
+/* the two worlds: the current one engaged (neutral, on both pages), the other the resting ink, with the arrow that
+ * says it is another page */
+#worlds {
+  grid-column: 2;
+  display: flex; align-items: stretch; gap: 2px;
+  height: var(--bar-h); padding: calc(var(--bar-pad) - 1px); border-radius: 999px;
+  font-size: 13px; font-weight: 600; line-height: 1;
+}
+#worlds .seg {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 0 10px; border-radius: 999px;
+  color: var(--bar-ink); text-decoration: none; white-space: nowrap;
+  transition: background-color 150ms var(--ease), color 150ms var(--ease);
+}
+#worlds a.seg:hover { background: var(--surface-2); color: var(--ink); }
+#worlds .seg[aria-current] { background: var(--surface-3); color: var(--ink); cursor: default; }
+#worlds .long { display: none; }
+svg.i.out { width: 13px; height: 13px; stroke-width: 2; }
+@media (min-width: 760px) {
+  #worlds .seg { padding: 0 16px; }
+  #worlds a.seg { padding: 0 14px 0 16px; }
+  #worlds .long { display: inline; }
+}
+/* a phone: the switch moves into the live numbers' panel (#worlds-alt), freeing the top bar */
+#worlds-alt { display: none; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line-soft); align-items: center; gap: 10px; }
+#worlds-alt .btn { flex: none; min-height: 40px; padding: 0 12px; text-decoration: none; }
+#worlds-alt span { font-size: 12px; color: var(--ink-3); line-height: 1.4; }
+
+#tools {
+  grid-column: 3; justify-self: end;
+  display: flex; align-items: center; gap: 2px;
+  height: var(--bar-h); padding: calc(var(--bar-pad) - 1px); border-radius: 999px;
+}
+
+/* words only where an icon is vague (Turbo, View, Setup), on wide screens */
+#menubtn span, #turbobtn span, #viewmenubtn span { display: none; }
+/* (Turbo's word is its name, it has no label: kept for a screen reader where it is not shown, as it was from 600 px) */
+@media (min-width: 600px) and (max-width: 759px) {
+  #turbobtn span { display: inline; position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+}
+/* (display by the id alone, so the pages' mode rules, such as body.turbo-on #turbobtn, still hide them) */
+@media (min-width: 760px) {
+  #turbobtn span, #viewmenubtn span { display: inline; }
+  #turbobtn, #viewmenubtn { display: inline-flex; align-items: center; justify-content: center; }
+  #dock #turbobtn, #dock #viewmenubtn { width: auto; padding: 0 15px 0 11px; gap: 7px; font-size: 13px; font-weight: 600; }
+}
+@media (min-width: 960px) {
+  #menubtn span { display: inline; }
+  #menubtn { display: inline-flex; align-items: center; justify-content: center; }
+  #tools #menubtn { width: auto; padding: 0 15px 0 11px; gap: 7px; font-size: 13px; font-weight: 600; }
+}
+
+/* the dock: its box is the reserved band (--dock-h), the shell its foot (--bar-h) */
+#dock {
+  position: fixed; z-index: var(--z-dock);
+  left: 50%; bottom: calc(var(--bar-edge) + var(--safe-b));
+  transform: translateX(-50%);
+  width: max-content; max-width: calc(100vw - 2 * var(--bar-edge));
+  height: var(--dock-h);
+  display: flex; align-items: center; gap: 2px;
+  padding: calc(var(--dock-h) - var(--bar-h) + var(--bar-pad)) var(--bar-pad) var(--bar-pad);
+  background: none; border: 0; border-radius: 0; box-shadow: none;
+  transition: transform 260ms var(--ease), opacity 200ms var(--ease);
+}
+#dock::before { content: ""; position: absolute; z-index: -1; left: 0; right: 0; bottom: 0; height: var(--bar-h); border-radius: 999px; }
+/* only the painted pill and its controls take input: the reserved band above the pill lets taps reach the tank.
+ * The pages' own rules still hide the dock under a narrow screen's open sheet; there its contents take no input either. */
+#dock, body.sheet-open #dock { pointer-events: none; }
+#dock::before, #dock > * { pointer-events: auto; }
+@media (max-width: 959px) {
+  body.sheet-open #dock::before, body.sheet-open #dock > * { pointer-events: none; }
+}
+#dock .dock-sep { flex: none; width: 1px; height: 20px; margin: 0 6px; background: var(--bar-div); }
+#dock .speed { position: relative; display: flex; align-items: center; margin-left: 4px; }
+#dock .speed .icon-btn { width: var(--bar-btn); }
+#speedlabel { min-width: 36px; text-align: center; font: 600 14px/1 var(--mono); font-variant-numeric: tabular-nums; color: var(--ink); }
+/* Hold 60 fps runs fewer steps than asked: the label lifts and the caption under it says how many, in ember */
+#speedlabel.capped { transform: translateY(-5px); }
+#speedcap { position: absolute; left: 50%; bottom: 5px; transform: translateX(-50%); white-space: nowrap; pointer-events: none;
+            font-size: 10px; line-height: 1; font-weight: 600; color: var(--bar-mode-ink); }
+@media (pointer: coarse) {
+  #dock .speed .icon-btn { width: 36px; }
+  #speedlabel { min-width: 28px; }
+}
+/* Turbo's strip (the Ocean): Stop, a sparkline of the fish, its numbers; short of room the numbers clip, and Stop
+ * (Cancel) and the sparkline never leave the dock */
+#turbo-strip { display: flex; align-items: center; min-width: 0; }
+#dock #turboexit { display: inline-flex; align-items: center; justify-content: center; width: auto; padding: 0 15px 0 12px; gap: 7px; font-size: 13px; font-weight: 650; }
+#dock #turboexit svg.i { width: 16px; height: 16px; }
+#turbo-sparkline { flex: none; width: 64px; height: 24px; margin: 0 6px; }
+.ts-nums { display: flex; align-items: baseline; gap: 12px; min-width: 0; overflow: hidden; padding-right: 6px;
+           font-size: 12px; color: var(--bar-ink); white-space: nowrap; }
+.ts-nums b { font: 600 13px var(--mono); font-variant-numeric: tabular-nums; color: var(--ink); }
+
+/* the keys (the Ocean, a wide screen with a mouse): a caption beside the dock, not a box, its centre line on the dock's */
+#keys {
+  position: fixed; z-index: var(--z-hud);
+  left: calc(var(--bar-edge) + 6px); bottom: calc(var(--bar-edge) + var(--safe-b));
+  max-width: calc(50vw - 290px - 24px); min-height: var(--bar-h);
+  display: none; flex-wrap: wrap; align-items: center; align-content: center; gap: 2px 14px;
+  padding: 0; border: 0; border-radius: 0; background: none; box-shadow: none;
+  font-size: 12px; line-height: 18px; color: var(--bar-ink);
+  text-shadow: 0 1px 6px oklch(0.12 0.03 205);
+}
+#keys .k { display: inline-flex; align-items: center; gap: 3px; margin: 0; white-space: nowrap; }   /* lines break between keys only */
+#keys kbd { display: inline-block; min-width: 16px; margin: 0 1px 0 0; padding: 0 4px; border: 1px solid oklch(0.55 0.03 190 / 0.45); border-radius: 4px;
+            background: none; color: inherit; text-align: center; font: 600 11px/16px var(--mono); }
+@media (min-width: 1100px) and (min-height: 561px) and (pointer: fine) {
+  #keys { display: flex; }
+  body.sheet-open #keys, body.help-open #keys { display: none; }
+}
+
+/* the coach mark (the Ocean's Turbo tip): the shell, just above the dock, its arrow in the shell's colours */
+#coach { bottom: calc(var(--bar-edge) + var(--safe-b) + var(--bar-h) + 14px); }
+#coach::after { background: oklch(0.235 0.028 198); border-right: 1px solid var(--bar-rim); border-bottom: 1px solid var(--bar-rim); }
+#coach #coachgo { background: var(--bar-mode); color: var(--bar-mode-ink); }        /* "Try Turbo": Turbo's colour, not Start's lime */
+#coach #coachgo:hover { background: oklch(0.72 0.18 38 / 0.28); }
+
+/* toasts: a lighter caption pill (no rim, no shadow), just above the dock (a phone: under the top bar) */
+#toasts {
+  position: fixed; z-index: var(--z-toast);
+  left: 50%; transform: translateX(-50%);
+  bottom: calc(var(--bar-edge) + var(--safe-b) + var(--bar-h) + 12px);
+  width: min(calc(100vw - 24px), 440px);
+  display: flex; flex-direction: column; gap: 8px; align-items: center;
+  pointer-events: none;
+}
+.toast {
+  padding: 7px 14px; border: 0; border-radius: 18px;
+  background: oklch(0.235 0.028 198 / 0.72); box-shadow: none;
+  font-size: 13px; color: var(--ink-2); line-height: 1.45;
+  animation: toast-in 220ms var(--ease);
+}
+.toast.error { color: var(--ink); box-shadow: inset 0 0 0 1px oklch(0.72 0.18 38 / 0.7); }   /* ember: a warning */
+.toast.out { opacity: 0; transform: translateY(6px); transition: opacity 200ms, transform 200ms; }
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } }
+/* never over an open View or Help popover: out of sight while one is open (a screen reader still hears them) */
+body:has(#viewpop:not([hidden])) #toasts, body.help-open #toasts { clip-path: inset(50%); }
+
+/* a wide screen's open settings: the top bar ends at the panel (the switch centres in what is left) */
+@media (min-width: 960px) {
+  body.sheet-open #topbar { right: calc(400px + var(--bar-edge)); --tb-room: calc(100vw - 400px - 2 * var(--bar-edge)); }
+}
+
+/* a phone (below 600 px): the readout and the tools; the world switch is in the live numbers' panel. The dock spans the
+ * screen, and its buttons give way (from 44 px down to 34) so it fits paused too, with the step button */
+@media (max-width: 599px) {
+  #topbar { grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; }
+  #tools { grid-column: 2; }
+  #worlds { display: none; }
+  #worlds-alt { display: flex; }
+  #readout { max-width: 100%; gap: 10px; padding: 0 14px; font-size: 14px; }
+  #readout .sep { display: none; }
+  #toasts { top: calc(var(--bar-edge) + var(--safe-t) + var(--bar-h) + 8px); bottom: auto; }
+  #dock { width: calc(100vw - 2 * var(--bar-edge)); justify-content: space-between; }
+  #dock > .icon-btn { flex: 0 1 auto; min-width: 34px; }
+  #dock .speed { margin-left: 0; }
+  #dock .speed .icon-btn { width: 36px; }
+  #speedlabel { min-width: 28px; }
+  #dock .dock-sep { margin: 0 2px; }
+  /* Turbo's strip: Stop (its icon), the sparkline, generation and rate (the fish are in the readout) */
+  #dock #turboexit { width: var(--bar-btn); padding: 0; }
+  #turboexit .ts-word, .ts-nums .ts-pop { display: none; }
+  #turbo-strip { flex: 1 1 auto; }
+  .ts-nums { gap: 8px; }
+}
+@media (max-width: 479px) {
+  #readout { padding: 0 16px 0 14px; }
+  .runstate, .runstate[data-s] { height: auto; padding: 0; background: none; }
+  .runstate::before { width: 8px; height: 8px; }
+  .runstate .rs-word { display: none; }
+}
+/* a 320-370 px phone: the dock fits paused too (eight buttons with the step), and the live numbers keep their room
+ * beside the tools */
+@media (max-width: 370px) {
+  #dock { gap: 0; }
+  #dock > .icon-btn { width: 34px; }
+  #dock .speed .icon-btn { width: 26px; }
+  #speedlabel { min-width: 2.2em; }
+  #dock .dock-sep { margin: 0 1px; }
+  #turbo-sparkline { display: none; }
+  #readout { gap: 6px; padding: 0 12px; }
+  #readout .mark { display: none; }
+}
