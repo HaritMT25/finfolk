@@ -911,6 +911,9 @@
       <button id="drawerclose" class="icon-btn" aria-label="close setup"><svg class="i"><use href="#i-close"/></svg></button>
     </div>
     <div id="setup-turbo" class="turbo-bar" role="status" hidden><svg class="i"><use href="#i-bolt"/></svg><span>Turbo is running: <b id="st-rate">–</b> steps/s</span><button id="setup-turbo-stop" class="btn">Stop Turbo</button></div>
+    <style>
+      #drawer .setup-status { display: inline-block; margin-left: 6px; padding: 2px 6px; border-radius: 999px; font-size: 10px; font-weight: 400; letter-spacing: normal; text-transform: none; color: var(--beam); background: var(--beam-soft); }
+    </style>
     <nav id="tabs" role="tablist" aria-label="setup sections"></nav>
     <div id="panels">
       <section class="panel" data-tab="run" id="panel-run">

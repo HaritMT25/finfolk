@@ -244,7 +244,7 @@
         cap: "Genes per fish, on average: the size of its brain's wiring list.",
         data: function () { return { t: view.t, series: [line("genes", su(18), S[6])] }; } },
       { id: "body", title: "Body size and shape", draw: C.lines, when: function () { return view.f.body; },
-        needs: "Shows up when bodies evolve (Setup → World → Evolving bodies).",
+        needs: "Shows up when bodies evolve (Setup → Life → Body size → Evolving bodies).",
         cap: "Average body size and elongation (both start at 1).",
         legend: function () { return [{ name: "size", color: S[0] }, { name: "elongation", color: S[1] }]; },
         data: function () { return { t: view.t, zero: false, series: [line("size", su(16), S[0]), line("elongation", su(17), S[1])] }; } },

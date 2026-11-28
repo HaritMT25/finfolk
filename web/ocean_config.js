@@ -57,7 +57,7 @@
     waveSpeed: [0, { step: 0.5, min: 0, max: 100 }], waveBand: [32, { min: 1 }], waveGravity: [20, { min: 0.01 }],
     lightEnabled: [false], L0: [1, { step: 0.1, min: 0, max: 100 }], kWater: [0.006, { step: 0.001, min: 0, max: 1 }],
     sizeDrift: [false], sizeFight: [false], mouthGate: [false], kMouth: [2, { step: 0.1, min: 0.01 }],
-    steerFrame: [0, { options: ["World x / y (Classic's)", "The fish's own frame"] }],
+    steerFrame: [0, { options: ["World axes (2-D style)", "Fish's own heading"] }],
     eye: [0, { bit: true }], eyeOnly: [0, { bit: true }], eyeCode: [0, { step: 1, min: 0, max: 31, int: true }],
     appearance: [3, { options: ["Off", "Skin patterns only", "Body shapes only", "Patterns and body shapes"] }],
     patternMutation: [0.025, { step: 0.005, min: 0, max: 0.25 }], patternPhaseMutation: [0.03, { step: 0.005, min: 0, max: 0.25 }],
@@ -128,20 +128,22 @@
   var TABS = [
     { id: "run", title: "Run" },
     { id: "world", title: "World", groups: [
-      ["The world", ["seed", "population", "width", "height", "depth", "bodyModel"]],
-      ["The tank's sides", ["walls", "sideWallBand", "sideWallTurnRate", "toroidal"]],
+      ["The world", ["seed", "population", "width", "height", "depth"]],
+      ["Tank & boundaries", ["walls", "sideWallBand", "sideWallTurnRate", "wallBand", "toroidal"]],
       ["Population limits", ["maxPopulation", "minPopulation"]],
-      ["Movement", ["minSpeed", "maxSpeed", "triangularMotion", "maxTurnRate"]],
+      ["Swimming & steering", ["minSpeed", "maxSpeed", "triangularMotion", "maxTurnRate", "pitchMax", "vDrag", "steerFrame"]],
       ["Senses", ["perceptionRadius", "interactRadius", "maxNeighbors"]],
+      ["Eye", ["eye", "eyeOnly", "eyeCode"]],
       ["Numerics", ["fastTanh"]]] },
     { id: "food", title: "Food", groups: [
-      ["Food", ["foodPatches", "foodPatchRadius", "targetFood", "foodSpawnBase", "foodSpawnAmp", "foodEnergy", "pickupRadius", "foodDrift", "foodLife"]],
-      ["Food in depth", ["foodDepthMode", "foodDepthSpread"]]] },
+      ["Food supply", ["targetFood", "foodSpawnBase", "foodSpawnAmp", "foodEnergy", "foodDrift", "pickupRadius", "foodLife"]],
+      ["Patches", ["foodPatches", "foodPatchRadius", "foodDepthMode", "foodDepthSpread"]],
+      ["Who can eat", ["mouthGate", "kMouth"]]] },
     { id: "life", title: "Life", groups: [
       ["Energy and age", ["metabolicRate", "moveCost", "geneCost", "maxAge", "reproEnergy", "newbornEnergy"]],
-      ["Genes", ["mutationMultiplier", "genomeInitMin", "genomeInitMax", "genomeMinLength", "genomeMaxLength"]],
       ["Who can breed", ["reproMaxDistance", "reproSoftWidth", "reproGracePeriod"]],
-      ["Bodies", ["bodyMutation", "buoyMutation"]],
+      ["Genes", ["mutationMultiplier", "genomeInitMin", "genomeInitMax", "genomeMinLength", "genomeMaxLength"]],
+      ["Body size", ["bodyModel", "bodyMutation", "sizeFight", "sizeDrift"]],
       ["Appearance (looks only)", ["appearance", "patternMutation", "patternPhaseMutation", "patternNovelProbability",
                                    "morphologyMutation", "morphologyNovelProbability"]]] },
     { id: "predators", title: "Predators", groups: [
@@ -149,17 +151,11 @@
       ["Hunting", ["predatorSpeed", "predatorPerception", "predatorCaptureRadius", "predatorCooldown"]],
       ["Their economy", ["predatorMeal", "predatorMetabolism", "predatorReproEnergy", "predatorMaxAge"]],
       ["Limits and inheritance", ["predatorMinPopulation", "predatorMaxPopulation", "predatorInheritance", "predatorTraitMutation"]]] },
-    { id: "depth", title: "Depth", groups: [
-      ["Swimming in depth", ["kBuoy", "pitchMax", "vDrag", "wallBand"]],
-      ["What depth costs", ["cHold", "cPress", "depthCostScaled"]]] },
     { id: "ocean", title: "Water", groups: [
       ["Currents", ["currentStrength", "currentMode", "currentEddies", "currentCore", "currentDrift", "deepCurrent"]],
       ["Waves", ["waveSpeed", "waveBand", "waveGravity"]],
-      ["Light", ["lightEnabled", "L0", "kWater"]],
-      ["Size laws", ["sizeDrift", "sizeFight", "mouthGate", "kMouth"]]] },
-    { id: "senses", title: "Steering", groups: [
-      ["Steering", ["steerFrame"]],
-      ["The compound eye", ["eye", "eyeOnly", "eyeCode"]]] }
+      ["Buoyancy & depth", ["kBuoy", "buoyMutation", "cHold", "cPress", "depthCostScaled"]],
+      ["Underwater light", ["lightEnabled", "L0", "kWater"]]] }
   ];
 
   var LABELS = {
@@ -189,10 +185,10 @@
     predatorMaxAge: "Predator lifespan", predatorMinPopulation: "Predator floor",
     predatorMaxPopulation: "Predator cap", predatorInheritance: "Hunters inherit traits",
     predatorTraitMutation: "Trait mutation",
-    kBuoy: "Buoyancy pull", pitchMax: "Steepest dive", vDrag: "Vertical drag", wallBand: "Surface and floor cushion",
+    kBuoy: "Buoyancy pull", pitchMax: "Steepest dive", vDrag: "Vertical drag", wallBand: "Surface & floor cushion",
     cHold: "Cost of leaving neutral depth", cPress: "Cost of pressure", depthCostScaled: "Depth costs scale with metabolism",
     currentStrength: "Current strength", currentMode: "Current shape", currentEddies: "Eddies",
-    currentCore: "Eddy radius", currentDrift: "How fast the flow changes", deepCurrent: "A deep current",
+    currentCore: "Eddy radius / wall fade", currentDrift: "How fast the flow changes", deepCurrent: "A deep current",
     waveSpeed: "Wave strength", waveBand: "Wave taper band", waveGravity: "Wave dispersion",
     lightEnabled: "Light field", L0: "Surface light", kWater: "Light fall-off",
     sizeDrift: "Small fish drift more", sizeFight: "Big fish fight harder", mouthGate: "Mouth size limits food",
@@ -207,7 +203,7 @@
     reproSoftWidth: "0 = a hard limit", reproGracePeriod: "0 = off", predatorMeal: "-1 = the prey's whole store",
     predatorMaxAge: "0 = until it starves", predatorMinPopulation: "0 = off; put back below this",
     predatorMaxPopulation: "0 = none", currentDrift: "0 = a still pattern", fastTanh: "changes the numbers",
-    foodLife: "0 = until eaten", depth: "0 = surface", kBuoy: "per second", waveSpeed: "0 = still",
+    foodLife: "0 = until eaten", depth: "10 to 100000 · the surface is 0", kBuoy: "per second", waveSpeed: "0 = still",
     width: "100 to 100000", height: "100 to 100000", sideWallBand: "0 = bounce off only", sideWallTurnRate: "rad/s at the glass",
     cHold: "× metabolism when scaled", cPress: "× metabolism when scaled", eyeCode: "bits 1, 2, 4; cloaks 8, 16",
     patternMutation: "± per gene", morphologyMutation: "± per gene", patternPhaseMutation: "± per birth",
