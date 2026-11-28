@@ -231,7 +231,7 @@ constexpr std::size_t fieldCount() {
 
 #define OFP_FIELDS(T, N) \
     static_assert(detail::fieldCount<T>() == (N), #T " gained or lost a field: hash it in tools/ocean_fingerprint.hpp, then update this count")
-OFP_FIELDS(SimConfig, 83);   // previous 78 + weightMutationMode
+OFP_FIELDS(SimConfig, 83);   // 78 + weightMutationMode + four genome-v2 policy fields
 OFP_FIELDS(OceanConfig, 40);   // 37 + the body-plan preview's three (visitOceanConfigBodyPlan, hashed in `body`)
 OFP_FIELDS(appearance::Stats, 10);   // founders, offspring, pattern[4], morph[4]
 OFP_FIELDS(physical::Stats, 6);      // founders, offspring, mode[4]
@@ -247,7 +247,7 @@ OFP_FIELDS(BrainConversion, 3);
 OFP_FIELDS(NeuralNet, 6);   // neurons, flat + srcTypeBits[2], sinkTypeBits[2]: the gene-type masks, derived from the genome (which is hashed) by buildNeuralNet, so not hashed
 OFP_FIELDS(NeuralNet::Neuron, 2);
 OFP_FIELDS(NeuralNet::FlatConn, 2);
-OFP_FIELDS(WorldCommon, 31);   // 25 + Stage C: predRng_, nextPredatorId_, arenaFresh_ (ctr's tagged block), predLog_, predTally_ (statistics, not hashed)
+OFP_FIELDS(WorldCommon, 31);   // 25 + brainConversion + Stage C: predRng_, nextPredatorId_, arenaFresh_ (ctr's tagged block), predLog_, predTally_ (statistics, not hashed)
 OFP_FIELDS(WorldCommon::DeathRecord, 7 + CLUSTER_SKETCH_DIM);
 OFP_FIELDS(WorldCommon::BirthRecord, 6);
 OFP_FIELDS(repro::Edge, 2);

@@ -829,7 +829,7 @@ else
 fi
 # The Ocean's pre-cast check of int keys (ocean_config.hpp kSimConfigIntKeys)
 # must cover exactly the keys checkpoint::readConfig reads with intOr.
-RC_INT=$(sed -n '/^inline void readConfig/,/^}/p' src/core/checkpoint_io.hpp | grep -o 'intOr("[A-Za-z]*"' | sed 's/intOr("//;s/"//' | sort | tr '\n' ' ')
+RC_INT=$(sed -n '/inline bool readConfig(/,/^}/p' src/core/checkpoint_io.hpp | grep -o 'intOr("[A-Za-z]*"' | sed 's/intOr("//;s/"//' | sort | tr '\n' ' ')
 OC_INT=$(sed -n '/kSimConfigIntKeys\[\] = {/,/};/p' src/ocean/ocean_config.hpp | grep -o '"[A-Za-z]*"' | tr -d '"' | sort | tr '\n' ' ')
 if [ -n "$RC_INT" ] && [ "$RC_INT" = "$OC_INT" ]; then
     echo "== int keys: kSimConfigIntKeys == checkpoint::readConfig's intOr keys ($(echo "$OC_INT" | wc -w))"
@@ -838,7 +838,7 @@ else
 fi
 # And the bool-key check (kSimConfigBoolKeys, kOceanBoolKeys) exactly the keys
 # readConfig reads with boolOr and readOceanConfig with readBool.
-RC_BOOL=$(sed -n '/^inline void readConfig/,/^}/p' src/core/checkpoint_io.hpp | grep -o 'boolOr("[A-Za-z]*"' | sed 's/boolOr("//;s/"//' | sort | tr '\n' ' ')
+RC_BOOL=$(sed -n '/inline bool readConfig(/,/^}/p' src/core/checkpoint_io.hpp | grep -o 'boolOr("[A-Za-z]*"' | sed 's/boolOr("//;s/"//' | sort | tr '\n' ' ')
 OC_BOOL=$(sed -n '/kSimConfigBoolKeys\[\] = {/,/};/p' src/ocean/ocean_config.hpp | grep -o '"[A-Za-z]*"' | tr -d '"' | sort | tr '\n' ' ')
 RO_BOOL=$(sed -n '/^inline bool readOceanConfig/,/^}/p' src/ocean/ocean_config.hpp | grep -o 'readBool(o, "[A-Za-z]*"' | sed 's/.*"\([A-Za-z]*\)"/\1/' | sort | tr '\n' ' ')
 OO_BOOL=$(sed -n '/kOceanBoolKeys\[\] = {/,/};/p' src/ocean/ocean_config.hpp | grep -o '"[A-Za-z]*"' | tr -d '"' | sort | tr '\n' ' ')

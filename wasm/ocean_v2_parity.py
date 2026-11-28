@@ -100,6 +100,10 @@ for suffix in ([''] if settings.no_eye else ['', '_eye']):
             ('native', [str(out / ('ocean_tests_native' + suffix))]),
             ('wasm', ['node', '--max-old-space-size=6144', str(out / ('ocean_tests_wasm' + suffix + '.js'))])
         ]:
-            run(name + suffix + '.' + target,
+            label = name + suffix + '.' + target
+            run(label,
                 command + ['--accepts', '1', '10'] + options, expected=1)
+            reason = 'refused by oc_set_param' if name.startswith('r_v2_live_') else 'refused by oc_init'
+            diagnostics = (evidence / (label + '.txt')).read_text() + (evidence / (label + '.log')).read_text()
+            assert reason in diagnostics, (label, reason, diagnostics)
     print('PASS v2/bias refusals', suffix or 'plain', len(cases), 'native and wasm', flush=True)
