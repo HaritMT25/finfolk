@@ -5,6 +5,9 @@
 //   - tabIndexFor: Left / Right round the ends, Home / End, nothing else
 //   - tabs(): a roving tabindex, the keys with the focus going along, wrapping, modified keys and other targets left alone, a
 //     pointer's press releasing the focus and the keyboard's keeping it
+//   - tabs() on a strip wider than its drawer (the owner's unreachable Steering tab, PR #113): a vertical wheel scrolls it
+//     sideways (and only then takes the wheel), the selected tab kept in view without see-sawing (a tab nearly as wide as the
+//     strip, one wider), a resize keeps it in view, the edge fades, and no fade over a keyboard's focus (ui_common.css)
 //   - returnPoint(): the focus back to a keyboard opener, only when the keyboard closes
 //   - both pages' dashboards (web/dashboard.js: Classic; web/ocean_dash.js: the Ocean) on a small DOM, the same assertions for
 //     both: the UI parity plan's U37 (Classic's tabs had no keys and blurred on every press)
@@ -259,6 +262,63 @@ section("tabs(): one tablist");
   D.tabTo(btn.y);
   D.key("ArrowRight");
   ok(cur === "y", "the current id not among the ids (removed): Right selects the first");
+}
+
+section("tabs(): a strip wider than its drawer (a mouse's wheel, the selected tab in view, the fades)");
+{
+  /* geometry the small DOM lacks: a 400 px row of tabs in a strip cw px wide; scrollLeft clamps and fires scroll, as a browser's */
+  const D = makeDom(); load(["ui_common.js"], { console, window: D.win });   /* (a window, for the resize listener: it registers there) */
+  const U = D.win.EvoUI;
+  const list = D.make("nav", "wide"), widths = { a: 60, b: 60, c: 80, d: 140, e: 60 }, ids = Object.keys(widths), btn = {}, off = {};
+  list.setAttribute("role", "tablist");
+  let total = 0; for (const id of ids) { off[id] = total; total += widths[id]; }
+  let sl = 0, cw = 100, cur = "a";
+  const clamp = (v) => Math.max(0, Math.min(total - cw, v));
+  Object.defineProperty(list, "scrollWidth", { get: () => total });
+  Object.defineProperty(list, "clientWidth", { get: () => cw, set: (v) => { cw = v; sl = clamp(sl); } });
+  Object.defineProperty(list, "scrollLeft", { get: () => sl, set: (v) => { const n = clamp(v); if (n !== sl) { sl = n; list.dispatchEvent(new D.Ev("scroll")); } } });
+  list.getBoundingClientRect = () => ({ left: 0, right: cw, width: cw, top: 0, bottom: 30, height: 30 });
+  const T = U.tabs(list, { ids: () => ids, current: () => cur, button: (id) => btn[id] || null, select: (id) => { cur = id; T.mark(id); } });
+  for (const id of ids) {
+    const b = D.make("button", "w-" + id, list); b.setAttribute("role", "tab"); btn[id] = b; T.bind(b, id);
+    b.getBoundingClientRect = () => ({ left: off[id] - sl, right: off[id] - sl + widths[id], width: widths[id], top: 0, bottom: 30, height: 30 });
+  }
+  const at = (id) => [off[id] - sl, off[id] - sl + widths[id]], whole = (id) => at(id)[0] >= 0 && at(id)[1] <= cw;
+  const fades = () => (list.classList.contains("ui-more-l") ? "L" : "-") + (list.classList.contains("ui-more-r") ? "R" : "-");
+  const wheel = (o) => { const ev = new D.Ev("wheel", Object.assign({ deltaX: 0, deltaY: 0, deltaMode: 0, ctrlKey: false }, o)); list.dispatchEvent(ev); return ev; };
+  const resize = () => { for (const f of D.win._ls.resize || []) f({ type: "resize" }); };
+  T.mark("a");
+  ok(sl === 0 && fades() === "-R", "overflowing, at its start: the right edge fades (more there)", { sl, fades: fades() });
+  let ev = wheel({ deltaY: 100 });
+  ok(sl === 100 && ev.defaultPrevented && fades() === "LR", "a vertical wheel scrolls it sideways and takes the wheel; both edges fade", { sl, fades: fades() });
+  ev = wheel({ deltaY: 3, deltaMode: 1 });
+  ok(sl === 148 && ev.defaultPrevented, "a wheel in lines: 16 px a line", { sl });
+  ev = wheel({ deltaY: 100, ctrlKey: true });
+  const e2 = wheel({ deltaX: 50, deltaY: 10 });
+  ok(sl === 148 && !ev.defaultPrevented && !e2.defaultPrevented, "Ctrl + wheel (zoom) and a sideways-first wheel: left to the browser", { sl });
+  ev = wheel({ deltaY: 1000 });
+  const e3 = wheel({ deltaY: 10 });
+  ok(sl === 300 && ev.defaultPrevented && !e3.defaultPrevented && fades() === "L-", "at its end: the wheel goes back to the page; only the left edge fades", { sl, fades: fades() });
+  btn.c.click();
+  const c1 = sl; T.mark("c"); const c2 = sl; T.mark("c");
+  ok(cur === "c" && whole("c") && c1 === c2 && sl === c2, "a tab nearly as wide as the strip: shown whole, and marking it again moves nothing (no see-saw)", { c1, c2, sl, at: at("c") });
+  btn.d.click();
+  const d1 = sl; T.mark("d");
+  ok(cur === "d" && at("d")[0] === 0 && sl === d1, "a tab wider than the strip: its start at the strip's start, every time", { d1, sl, at: at("d") });
+  btn.b.click();
+  ok(whole("b") && at("b")[0] >= 20, "a click on a tab at the far left: shown whole, clear of the fade", { sl, at: at("b") });
+  list.clientWidth = 70;
+  ok(!whole("b"), "(the drawer narrows: b now cut at the right)", { sl, at: at("b") });
+  resize();
+  ok(whole("b") && fades() === "LR", "a window resize shows the selected tab again (the Ocean's sheet becoming a 400 px drawer)", { sl, at: at("b"), fades: fades() });
+  list.clientWidth = 1000;
+  resize();
+  ev = wheel({ deltaY: 100 });
+  ok(sl === 0 && fades() === "--" && !ev.defaultPrevented, "a strip that fits: no fades, and the wheel is the page's", { sl, fades: fades() });
+  const css = fs.readFileSync(path.join(WEB, "ui_common.css"), "utf8"), iFade = css.indexOf(".ui-tablist.ui-more-l.ui-more-r {");
+  const iFocus = css.search(/\.ui-tablist\.ui-more-l:focus-within,\s*\.ui-tablist\.ui-more-r:focus-within\s*\{[^}]*-webkit-mask-image:\s*none;[^}]*\bmask-image:\s*none/);
+  ok(iFade >= 0 && iFocus > iFade, "ui_common.css: no fade while the keyboard is in the strip (after the fade rules, equal or higher specificity)", { iFade, iFocus });
+  ok(D.errors.length === 0, "no listener threw", D.errors.slice(0, 2));
 }
 
 section("returnPoint(): the focus back where the keyboard opened from");

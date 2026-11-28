@@ -117,7 +117,9 @@
     /** @param {HTMLElement} b */
     function reveal(b) {
       if (overflow() <= 1 || !b.getBoundingClientRect || !list.getBoundingClientRect) return;
-      var lr = list.getBoundingClientRect(), br = b.getBoundingClientRect(), pad = 28;   /* clear of the fade */
+      var lr = list.getBoundingClientRect(), br = b.getBoundingClientRect();
+      if (br.width >= lr.width) { list.scrollLeft += br.left - lr.left; return; }   /* wider than the strip: its start, always */
+      var pad = Math.min(28, (lr.width - br.width) / 2);   /* clear of the fade, as far as both sides fit (else calls would see-saw) */
       if (br.left < lr.left + pad) list.scrollLeft -= lr.left + pad - br.left;
       else if (br.right > lr.right - pad) list.scrollLeft += br.right - (lr.right - pad);
     }
@@ -131,7 +133,9 @@
       }, { passive: false });
       list.addEventListener("scroll", edges, { passive: true });
     }
-    if (typeof window !== "undefined" && window.addEventListener) window.addEventListener("resize", edges);
+    /* a resize (the Ocean's sheet becoming a 400 px drawer at 960 px) can hide the selected tab: show it again */
+    function refit() { var b = o.button(o.current()); if (b) reveal(b); edges(); }
+    if (typeof window !== "undefined" && window.addEventListener) window.addEventListener("resize", refit);
     /** @param {string} id */
     function mark(id) {
       o.ids().forEach(function (t) {
