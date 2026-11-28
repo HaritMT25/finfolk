@@ -24,10 +24,19 @@ assert.throws(()=>H.worldNow({...M,_oc_weight_mutation_mode:()=>255}),/unknown e
 const head={format:'evo_ocean_world',version:1,sha256:'a'.repeat(64),
  image:{bytes:65536,stored:0,body:'raw',bodyBytes:0,sha256:'b'.repeat(64)},
  start:{cfg:{genomeVersion:2}}};
-let text=JSON.stringify(head).replace('"genomeVersion":2','"genomeVersion":1,"genomeVersion":2');
-const bytes=Buffer.from(text),len=Buffer.alloc(4);len.writeUInt32LE(bytes.length);
-const file=new Uint8Array(Buffer.concat([Buffer.from(H.WORLD.MAGIC,'latin1'),len,bytes]));
-assert.throws(()=>H.worldHeader(file),/repeated brain policy member/,'header duplicate');
+function worldFile(text) {
+ const bytes=Buffer.from(text),len=Buffer.alloc(4);len.writeUInt32LE(bytes.length);
+ return new Uint8Array(Buffer.concat([Buffer.from(H.WORLD.MAGIC,'latin1'),len,bytes]));
+}
+const clean = JSON.stringify(head);
+H.worldHeader(worldFile(clean));
+assert.throws(()=>H.worldHeader(worldFile(clean.replace('"genomeVersion":2','"genomeVersion":1,"genomeVersion":2'))),/repeated brain policy member/,'header duplicate');
+for (const [label, text] of [
+ ['parent', clean.replace('"start":', '"start":{},"start":')],
+ ['runCfg', clean.replace('"start":', '"runCfg":{"genomeVersion":2},"runCfg":{"genomeVersion":1},"start":')],
+ ['ordinary', clean.replace('"bytes":65536', '"bytes":65536,"bytes":65536')],
+ ['escaped', clean.replace('"bytes":65536', '"by\\u0074es":65536,"bytes":65536')]
+]) assert.throws(()=>H.worldHeader(worldFile(text)),/repeated header member/,label);
 const ctx=vm.createContext({Math});
 vm.runInContext(fs.readFileSync(path.join(ROOT,'web/ui_common.js'),'utf8'),ctx);
 for (const [w,h] of [[640,300],[300,640]]) {

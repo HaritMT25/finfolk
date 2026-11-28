@@ -25,8 +25,13 @@ done
 if run --weight-mutation-mode; then
     echo 'accepted missing policy argument' >&2; exit 1
 fi
-# Resume follows checkpoint policy even when the CLI selects the other policy.
-run --load-checkpoint absent.json --weight-mutation-mode saturating --save-checkpoint resumed.json
+# Resume follows checkpoint policy; policy overrides require explicit conversion.
+if run --load-checkpoint absent.json --weight-mutation-mode saturating --save-checkpoint forbidden.json; then
+    echo "accepted ignored resume policy" >&2; exit 1
+fi
+grep -q "use genome_v2_convert" run.log
+test ! -e forbidden.json
+run --load-checkpoint absent.json --save-checkpoint resumed.json
 python3 - <<'PY'
 import json
 j=json.load(open('resumed.json'))

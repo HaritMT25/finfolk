@@ -224,6 +224,7 @@ int main(int argc, char** argv) {
     std::string csvPath;
     std::string runName;
     std::string saveCheckpoint;    // --save-checkpoint FILE (written at end of run)
+    bool haveBrainPolicyFlag = false;
     std::string loadCheckpoint;    // --load-checkpoint FILE (resume)
     int         checkpointEvery = 0;   // --checkpoint-every N (0 = off)
     std::string checkpointBase;        // prefix for the periodic files
@@ -311,26 +312,30 @@ int main(int argc, char** argv) {
         else if (arg == "--genome-init-min") rawGenomeLengths.emplace_back(&cfg.genomeInitMin, next("--genome-init-min"));
         else if (arg == "--genome-init-max") rawGenomeLengths.emplace_back(&cfg.genomeInitMax, next("--genome-init-max"));
         else if (arg == "--mutation")         cfg.mutationMultiplier= std::atof(next("--mutation"));
-        else if (arg == "--bias-genes") cfg.biasGenes = true;
+        else if (arg == "--bias-genes") { haveBrainPolicyFlag = true; cfg.biasGenes = true; }
         else if (arg == "--genome-version") {
+            haveBrainPolicyFlag = true;
             if (!strictInt(next("--genome-version"), cfg.genomeVersion)) {
                 std::cerr << "Error: --genome-version requires a complete integer.\n";
                 return 1;
             }
         }
         else if (arg == "--hidden-neurons") {
+            haveBrainPolicyFlag = true;
             if (!strictInt(next("--hidden-neurons"), cfg.hiddenNeurons)) {
                 std::cerr << "Error: --hidden-neurons requires a complete integer.\n";
                 return 1;
             }
         }
         else if (arg == "--brain-eval-version") {
+            haveBrainPolicyFlag = true;
             if (!strictInt(next("--brain-eval-version"), cfg.brainEvalVersion)) {
                 std::cerr << "Error: --brain-eval-version requires a complete integer.\n";
                 return 1;
             }
         }
         else if (arg == "--weight-mutation-mode") {
+            haveBrainPolicyFlag = true;
             const std::string mode = next("--weight-mutation-mode");
             if (!parseWeightMutationMode(mode, cfg.weightMutationMode)) {
                 std::cerr << "Error: --weight-mutation-mode must be legacy or saturating.\n";
@@ -418,6 +423,10 @@ int main(int argc, char** argv) {
 
     // Reseeding only means something on top of a loaded rng state; without a
     // checkpoint it would silently be a second --seed. Refuse instead.
+    if (!loadCheckpoint.empty() && haveBrainPolicyFlag) {
+        std::cerr << "Error: brain policy flags cannot be used with --load-checkpoint; use genome_v2_convert.\n";
+        return 1;
+    }
     if (haveReseedAfterLoad && loadCheckpoint.empty()) {
         std::cerr << "Error: --reseed-after-load needs --load-checkpoint (use --seed for a fresh run).\n";
         return 1;
